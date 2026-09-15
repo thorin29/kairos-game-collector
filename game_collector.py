@@ -136,6 +136,24 @@ class Coalescer:
 
 
 # ---------------------------------------------------------------- engine
+# Home Assistant now_playing "platform" values that are NOT an Xbox console — a
+# game showing one of these is being played on PC/mobile via the same Xbox
+# account, not the console we track.
+_NON_XBOX_PLATFORMS = {"windows", "android", "ios", "nintendo switch", "web"}
+
+
+def _is_xbox_console(platform) -> bool:
+    """True unless the platform is a KNOWN non-Xbox device. Unknown/None is
+    allowed (benefit of the doubt) so a missing attribute never zeroes real
+    console play; only confirmed PC/mobile platforms are excluded."""
+    if not platform:
+        return True
+    p = str(platform).strip().lower()
+    if p.startswith("xbox"):
+        return True
+    return p not in _NON_XBOX_PLATFORMS
+
+
 class Engine:
     def __init__(self, on_online, on_game, use_last_online=True):
         self.on_online_cb = on_online
@@ -143,6 +161,7 @@ class Engine:
         self.use_last_online = use_last_online
         self.last_online: dict[str, datetime] = {}
         self.np: dict[str, str | None] = {}
+        self.plat: dict[str, str | None] = {}
         self.ig: dict[str, bool | None] = {}
         self.online: dict[str, bool] = {}   # authoritative ONLINE-sensor state
         self.oc = Coalescer(self._emit_online)
@@ -168,8 +187,11 @@ class Engine:
     def set_in_game(self, friend, tri, ts):
         self.ig[friend] = tri; self._recompute(friend, ts)
 
-    def set_now_playing(self, friend, value, ts):
-        self.np[friend] = _norm(value); self._recompute(friend, ts)
+    def set_now_playing(self, friend, value, ts, platform=None):
+        self.np[friend] = _norm(value)
+        if platform is not None:
+            self.plat[friend] = platform
+        self._recompute(friend, ts)
 
     def set_last_online(self, friend, dt):
         if dt:
@@ -180,7 +202,8 @@ class Engine:
         # / in_game only decide WHICH game while already online, so a stale
         # now_playing can never manufacture Xbox time when online says off.
         title = self.np.get(friend); ig = self.ig.get(friend)
-        if self.online.get(friend) is True and title is not None and ig is not False:
+        console = _is_xbox_console(self.plat.get(friend))
+        if self.online.get(friend) is True and title is not None and ig is not False and console:
             self.gc.start(friend, title, ts)
         else:
             self.gc.stop(friend, ts)
@@ -315,11 +338,13 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
             intervals = [(s, e, g, 2 if src == "steam" else 1) for (src, g, s, e) in rows]
             tot, per = resolve_precedence(intervals)
         else:
-            tot = online.get(friend, 0.0)
-            per = {}
-            for (src, g, s, e) in rows:
-                if src == "xbox":
-                    per[g] = per.get(g, 0.0) + _mins(s, e)
+            # Xbox time is actual gameplay, not account-online presence. Xbox
+            # Network "online" can be a PC Xbox app, Game Pass, or lingering
+            # presence with no game running, so a kid who is merely online must
+            # log 0. Total = union of the kid's Xbox game sessions (the same
+            # basis Steam-primary uses); online_sessions stay for diagnostics.
+            intervals = [(s, e, g, 1) for (src, g, s, e) in rows if src == "xbox"]
+            tot, per = resolve_precedence(intervals)
         out[friend] = {
             "friend": friend, "date": today, "minutes": round(tot),
             "games": [{"game": g, "minutes": round(mn)} for g, mn in per.items() if round(mn) > 0],
@@ -470,7 +495,9 @@ class Client:
         for eid, friend in self.ig.items():
             self.xbox.ig[friend] = _tri(states.get(eid, {}).get("state"))
         for eid, friend in self.np.items():
-            self.xbox.np[friend] = _norm(states.get(eid, {}).get("state"))
+            st = states.get(eid, {})
+            self.xbox.np[friend] = _norm(st.get("state"))
+            self.xbox.plat[friend] = (st.get("attributes") or {}).get("platform")
         for eid, friend in self.on.items():
             self.xbox.set_online(
                 friend, str(states.get(eid, {}).get("state", "")).lower() == "on", now,
@@ -504,7 +531,8 @@ class Client:
             elif eid in self.ig:
                 self.xbox.set_in_game(self.ig[eid], _tri(new), ts)
             elif eid in self.np:
-                self.xbox.set_now_playing(self.np[eid], new, ts)
+                plat = ((d.get("new_state") or {}).get("attributes") or {}).get("platform")
+                self.xbox.set_now_playing(self.np[eid], new, ts, plat)
             elif eid in self.lo:
                 self.xbox.set_last_online(self.lo[eid], parse_ts(new))
             elif eid in self.gs:
@@ -658,6 +686,21 @@ def selftest():
     assert fmt_balance("$8") == "$8.00"
     assert fmt_balance("5.5 USD") == "$5.50"
     assert fmt_balance("unknown") is None
+    # Rollup: an Xbox account merely ONLINE with no game logs 0 (the old code
+    # counted online presence as game time); a real game still counts.
+    now = datetime.now(timezone.utc)
+    st = Store(":memory:")
+    st.add_online("P2", "xbox", now, now + timedelta(minutes=274), 274.0)
+    st.add_game("P3", "xbox", "ARK", now, now + timedelta(minutes=53), 53.0)
+    st.add_online("P3", "xbox", now, now + timedelta(minutes=160), 160.0)
+    days = compute_daily(st, timezone.utc, set())
+    assert days["P2"]["minutes"] == 0, days["P2"]
+    assert days["P3"]["minutes"] == 53, days["P3"]
+
+    # Platform gate: Windows/Android are not console time; Xbox / unknown are.
+    assert _is_xbox_console("Xbox Series X|S") and _is_xbox_console(None)
+    assert not _is_xbox_console("Windows") and not _is_xbox_console("Android")
+
     print("selftest OK \u2713")
 
 
