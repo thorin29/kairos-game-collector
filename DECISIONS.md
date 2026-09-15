@@ -15,12 +15,26 @@ Hard-won choices behind `game_collector.py`. Read before changing the engine.
   disposable buffer, pruned to `RETAIN_DAYS` (default 14).
 
 ## Session engine
-- **The online sensor is authoritative for Xbox time.** `now_playing` / `in_game`
-  only decide *which* game while already online. A stale `now_playing` (Xbox/HA
-  often doesn't clear the title when a kid goes offline) must never manufacture
-  Xbox time — this bug once gave a kid ~6h with zero real play, and only him
-  because his `now_playing` was stale while others' cleared. The snapshot records
-  OFFLINE explicitly on startup so stale presence can't leak in.
+- **Xbox time is actual gameplay, not account presence.** The daily Xbox total is
+  the **union of qualifying game sessions** (the same basis Steam-primary uses),
+  for *every* kid — not the Xbox-Network `online` sensor. `online` is only a gate
+  (a game session can't start unless the account is online) and a diagnostic
+  (`online_sessions` are still recorded but never counted). Reason: Xbox Network
+  "online" is *account* presence and can come from a PC Xbox app, Game Pass, or
+  lingering presence with no game running — counting it once gave a kid 274 min
+  on a day he played nothing. A kid who is merely online now logs 0, so a stale
+  bogus total is replaced by 0 on the next push with no manual clearing.
+- **`online` gates game sessions; `now_playing`/`in_game` decide which game.** A
+  stale `now_playing` can't manufacture time because a game session requires
+  `online == True`. The snapshot records OFFLINE explicitly on startup so stale
+  presence can't leak in. (This fixed the earlier ~6h-zero-play bug; the
+  online-as-total bug above was a separate, later fix.)
+- **Console-only via the `now_playing` `platform` attribute.** A game session is
+  dropped when its platform is a *known* non-Xbox device (Windows/Android/iOS/
+  Nintendo Switch/web), so PC Game-Pass play isn't attributed to the console
+  metric. Unknown/absent platform is allowed (benefit of the doubt) so a missing
+  attribute never zeroes real console play. Captured on both the startup snapshot
+  and `state_changed` events.
 - **Coalescing** — online/game sessions split by ≤ `COALESCE_GAP` (5 min) merge
   into one, and the gap counts as time. Kills presence-flap fragmentation.
 - **Games = `in_game` + `now_playing`** — active-play boundary from `in_game`
