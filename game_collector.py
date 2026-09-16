@@ -155,9 +155,11 @@ def _is_xbox_console(platform) -> bool:
 
 
 class Engine:
-    def __init__(self, on_online, on_game, use_last_online=True):
+    def __init__(self, on_online, on_game, use_last_online=True, label=None):
         self.on_online_cb = on_online
         self.on_game_cb = on_game
+        self.label = label          # set (e.g. "xbox") to log state transitions
+        self._diag_last: dict[str, str] = {}
         self.use_last_online = use_last_online
         self.last_online: dict[str, datetime] = {}
         self.np: dict[str, str | None] = {}
@@ -203,10 +205,37 @@ class Engine:
         # now_playing can never manufacture Xbox time when online says off.
         title = self.np.get(friend); ig = self.ig.get(friend)
         console = _is_xbox_console(self.plat.get(friend))
-        if self.online.get(friend) is True and title is not None and ig is not False and console:
+        recording = self.online.get(friend) is True and title is not None and ig is not False and console
+        if recording:
             self.gc.start(friend, title, ts)
         else:
             self.gc.stop(friend, ts)
+        self._diag(friend, title, ig, console, recording)
+
+    def _diag(self, friend, title, ig, console, recording):
+        """Log a deduped state line per friend so a dropped game is explainable."""
+        if not self.label:
+            return
+        online = self.online.get(friend); plat = self.plat.get(friend)
+        if recording:
+            verdict = f"recording {title}"
+        elif online is not True:
+            verdict = "not recording (account offline)"
+        elif title is None:
+            verdict = "not recording (no now_playing title)"
+        elif ig is False:
+            verdict = "not recording (in_game off)"
+        elif not console:
+            verdict = f"not recording (platform {plat} is not an Xbox console)"
+        else:
+            verdict = "not recording"
+        o = "on" if online is True else ("off" if online is False else "?")
+        g = "on" if ig is True else ("off" if ig is False else "?")
+        line = (f"[{self.label}] {friend:<14} online={o} in_game={g} "
+                f"now_playing={title or 'None'} platform={plat or 'None'} -> {verdict}")
+        if self._diag_last.get(friend) != line:
+            self._diag_last[friend] = line
+            print("  " + line, flush=True)
 
     def flush(self, now):
         self.oc.flush_expired(now); self.gc.flush_expired(now)
@@ -366,7 +395,7 @@ class Client:
         self.np: dict[str, str] = {}; self.lo: dict[str, str] = {}
         self.gs: dict[str, str] = {}; self.gp: dict[str, str] = {}; self.bal: dict[str, str] = {}
         self.status: dict[str, dict] = {}
-        self.xbox = Engine(self._mk_online("xbox"), self._mk_game("xbox"), use_last_online=True)
+        self.xbox = Engine(self._mk_online("xbox"), self._mk_game("xbox"), use_last_online=True, label="xbox")
         self.steam = Engine(self._mk_online("steam"), self._mk_game("steam"), use_last_online=False)
 
     def _set_status(self, friend, key, val):
