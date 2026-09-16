@@ -136,24 +136,6 @@ class Coalescer:
 
 
 # ---------------------------------------------------------------- engine
-# Home Assistant now_playing "platform" values that are NOT an Xbox console — a
-# game showing one of these is being played on PC/mobile via the same Xbox
-# account, not the console we track.
-_NON_XBOX_PLATFORMS = {"windows", "android", "ios", "nintendo switch", "web"}
-
-
-def _is_xbox_console(platform) -> bool:
-    """True unless the platform is a KNOWN non-Xbox device. Unknown/None is
-    allowed (benefit of the doubt) so a missing attribute never zeroes real
-    console play; only confirmed PC/mobile platforms are excluded."""
-    if not platform:
-        return True
-    p = str(platform).strip().lower()
-    if p.startswith("xbox"):
-        return True
-    return p not in _NON_XBOX_PLATFORMS
-
-
 class Engine:
     def __init__(self, on_online, on_game, use_last_online=True, label=None):
         self.on_online_cb = on_online
@@ -204,15 +186,19 @@ class Engine:
         # / in_game only decide WHICH game while already online, so a stale
         # now_playing can never manufacture Xbox time when online says off.
         title = self.np.get(friend); ig = self.ig.get(friend)
-        console = _is_xbox_console(self.plat.get(friend))
-        recording = self.online.get(friend) is True and title is not None and ig is not False and console
+        # Count ACTUAL gameplay wherever the account plays it — Xbox console or a
+        # game run through the Xbox app on a PC. We do NOT exclude by platform:
+        # the thing to exclude is mere account-online presence with no game, and
+        # requiring a title + in_game already does that. platform is captured only
+        # for the diagnostic log.
+        recording = self.online.get(friend) is True and title is not None and ig is not False
         if recording:
             self.gc.start(friend, title, ts)
         else:
             self.gc.stop(friend, ts)
-        self._diag(friend, title, ig, console, recording)
+        self._diag(friend, title, ig, recording)
 
-    def _diag(self, friend, title, ig, console, recording):
+    def _diag(self, friend, title, ig, recording):
         """Log a deduped state line per friend so a dropped game is explainable."""
         if not self.label:
             return
@@ -225,8 +211,6 @@ class Engine:
             verdict = "not recording (no now_playing title)"
         elif ig is False:
             verdict = "not recording (in_game off)"
-        elif not console:
-            verdict = f"not recording (platform {plat} is not an Xbox console)"
         else:
             verdict = "not recording"
         o = "on" if online is True else ("off" if online is False else "?")
@@ -725,10 +709,6 @@ def selftest():
     days = compute_daily(st, timezone.utc, set())
     assert days["P2"]["minutes"] == 0, days["P2"]
     assert days["P3"]["minutes"] == 53, days["P3"]
-
-    # Platform gate: Windows/Android are not console time; Xbox / unknown are.
-    assert _is_xbox_console("Xbox Series X|S") and _is_xbox_console(None)
-    assert not _is_xbox_console("Windows") and not _is_xbox_console("Android")
 
     print("selftest OK \u2713")
 
