@@ -159,7 +159,7 @@ class Engine:
         self.on_online_cb(friend, start, end, _mins(start, end))
 
     def _emit_game(self, friend, title, start, end):
-        self.on_game_cb(friend, title, start, end, _mins(start, end))
+        self.on_game_cb(friend, title, start, end, _mins(start, end), self.plat.get(friend))
 
     def set_online(self, friend, is_on, ts):
         self.online[friend] = bool(is_on)
@@ -257,21 +257,27 @@ class Store:
                 self.db.execute(f"ALTER TABLE {t} ADD COLUMN source TEXT DEFAULT 'xbox'")
             except sqlite3.OperationalError:
                 pass
+        # Additive: which platform a game session ran on (e.g. "PC" vs a console),
+        # captured live from the Xbox presence attribute. Existing rows stay NULL.
+        try:
+            self.db.execute("ALTER TABLE game_sessions ADD COLUMN platform TEXT")
+        except sqlite3.OperationalError:
+            pass
         self.db.commit()
 
     def add_online(self, friend, source, s, e, m):
         self.db.execute("INSERT INTO online_sessions(friend,source,start_utc,end_utc,minutes) VALUES(?,?,?,?,?)",
                         (friend, source, s.isoformat(), e.isoformat(), m)); self.db.commit()
 
-    def add_game(self, friend, source, game, s, e, m):
-        self.db.execute("INSERT INTO game_sessions(friend,source,game,start_utc,end_utc,minutes) VALUES(?,?,?,?,?,?)",
-                        (friend, source, game, s.isoformat(), e.isoformat(), m)); self.db.commit()
+    def add_game(self, friend, source, game, s, e, m, platform=None):
+        self.db.execute("INSERT INTO game_sessions(friend,source,game,start_utc,end_utc,minutes,platform) VALUES(?,?,?,?,?,?,?)",
+                        (friend, source, game, s.isoformat(), e.isoformat(), m, platform)); self.db.commit()
 
     def online_rows(self):
         return self.db.execute("SELECT friend,source,start_utc,end_utc,minutes FROM online_sessions").fetchall()
 
     def game_rows(self):
-        return self.db.execute("SELECT friend,source,game,start_utc,end_utc,minutes FROM game_sessions").fetchall()
+        return self.db.execute("SELECT friend,source,game,start_utc,end_utc,minutes,platform FROM game_sessions").fetchall()
 
     def platforms_by_friend(self) -> dict:
         out: dict[str, set] = {}
@@ -337,18 +343,23 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
         if source == "xbox" and today_dt(s_dt):
             online[friend] = online.get(friend, 0.0) + _mins(s_dt, e_dt)
     games = {}
-    for friend, source, game, s, e, m in store.game_rows():
+    for friend, source, game, s, e, m, plat in store.game_rows():
         if today_iso(s):
-            games.setdefault(friend, []).append((source, game, parse_ts(s), parse_ts(e)))
-    for friend, source, game, s_dt, e_dt in (extra_games or []):
+            games.setdefault(friend, []).append((source, game, plat, parse_ts(s), parse_ts(e)))
+    for friend, source, game, s_dt, e_dt, plat in (extra_games or []):
         if today_dt(s_dt):
-            games.setdefault(friend, []).append((source, game, s_dt, e_dt))
+            games.setdefault(friend, []).append((source, game, plat, s_dt, e_dt))
 
     out = {}
     for friend in set(online) | set(games):
         rows = games.get(friend, [])
+        # A game's platform for the day (last non-null session wins).
+        plat_by_game: dict[str, str | None] = {}
+        for (src, g, plat, s, e) in rows:
+            if plat:
+                plat_by_game[g] = plat
         if friend in steam_friends:
-            intervals = [(s, e, g, 2 if src == "steam" else 1) for (src, g, s, e) in rows]
+            intervals = [(s, e, g, 2 if src == "steam" else 1) for (src, g, plat, s, e) in rows]
             tot, per = resolve_precedence(intervals)
         else:
             # Xbox time is actual gameplay, not account-online presence. Xbox
@@ -356,11 +367,11 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
             # presence with no game running, so a kid who is merely online must
             # log 0. Total = union of the kid's Xbox game sessions (the same
             # basis Steam-primary uses); online_sessions stay for diagnostics.
-            intervals = [(s, e, g, 1) for (src, g, s, e) in rows if src == "xbox"]
+            intervals = [(s, e, g, 1) for (src, g, plat, s, e) in rows if src == "xbox"]
             tot, per = resolve_precedence(intervals)
         out[friend] = {
             "friend": friend, "date": today, "minutes": round(tot),
-            "games": [{"game": g, "minutes": round(mn)} for g, mn in per.items() if round(mn) > 0],
+            "games": [{"game": g, "minutes": round(mn), "platform": plat_by_game.get(g)} for g, mn in per.items() if round(mn) > 0],
         }
     return out
 
@@ -394,8 +405,8 @@ class Client:
         return cb
 
     def _mk_game(self, source):
-        def cb(friend, game, s, e, m):
-            self.store.add_game(friend, source, game, s, e, m)
+        def cb(friend, game, s, e, m, platform=None):
+            self.store.add_game(friend, source, game, s, e, m, platform)
             src = "" if source == "xbox" else " (steam)"
             print(f"    \u00b7 game   {friend:<14} {game+src:<26} {s.astimezone(self.tz):%H:%M}\u2192{e.astimezone(self.tz):%H:%M}  {m:>5.1f} min", flush=True)
         return cb
@@ -603,8 +614,8 @@ class Client:
         now = datetime.now(timezone.utc)
         extra_online = ([(f, "xbox", s, e) for (f, s, e) in self.xbox.live_online(now)]
                         + [(f, "steam", s, e) for (f, s, e) in self.steam.live_online(now)])
-        extra_games = ([(f, "xbox", g, s, e) for (f, g, s, e) in self.xbox.live_games(now)]
-                       + [(f, "steam", g, s, e) for (f, g, s, e) in self.steam.live_games(now)])
+        extra_games = ([(f, "xbox", g, s, e, self.xbox.plat.get(f)) for (f, g, s, e) in self.xbox.live_games(now)]
+                       + [(f, "steam", g, s, e, None) for (f, g, s, e) in self.steam.live_games(now)])
         days = compute_daily(self.store, self.tz, set(self.steam_ids), extra_online, extra_games)
         for friend in self.status:                       # include status even with no play today
             days.setdefault(friend, {"friend": friend, "date": today, "minutes": 0, "games": []})
