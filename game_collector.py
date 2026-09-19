@@ -38,6 +38,15 @@ except Exception:
 
 UNSET = {"", "none", "unknown", "unavailable"}
 COALESCE_GAP = timedelta(minutes=5)
+# When the game signal drops (title -> None or in_game -> off) but the account is
+# still shown online, keep crediting the LAST game this long past its last real
+# sighting, then give up. This rides out title flicker, brief menus/load screens,
+# and party chat stealing the "now playing" slot on the same PC. It is measured
+# from the last genuine game ping (a phantom device idling online never advances
+# that), so an Xbox app left open in party chat can't run the clock up: the grace
+# expires and the game closes. Kept short because the kids sign off soon after they
+# actually stop — a long online tail is the idle app, not play. Tune via env.
+GAME_HOLD = timedelta(minutes=int(os.environ.get("GAME_HOLD_MIN", "5")))
 FLUSH_INTERVAL = 20
 STEAM_POLL = 60
 PUSH_INTERVAL = 300   # push rollups+status to Kairos every 5 min
@@ -148,6 +157,14 @@ class Engine:
         self.plat: dict[str, str | None] = {}
         self.ig: dict[str, bool | None] = {}
         self.online: dict[str, bool] = {}   # authoritative ONLINE-sensor state
+        # Last GENUINE game sighting per friend (title + the device it was on), and
+        # the moment the live signal dropped while a game was open. The hold in
+        # _recompute is measured from that drop moment — anchored to the game
+        # device, never refreshed by a phantom device idling online — so an idle
+        # second device can neither break an active session nor hold a dead one open.
+        self.last_game: dict[str, str] = {}
+        self.last_game_plat: dict[str, str | None] = {}
+        self._dropped_at: dict[str, datetime] = {}
         self.oc = Coalescer(self._emit_online)
         self.gc = Coalescer(self._emit_game)
 
@@ -159,7 +176,10 @@ class Engine:
         self.on_online_cb(friend, start, end, _mins(start, end))
 
     def _emit_game(self, friend, title, start, end):
-        self.on_game_cb(friend, title, start, end, _mins(start, end), self.plat.get(friend))
+        # Prefer the platform the game was actually seen on, so a phantom PC that
+        # held the "now playing" slot last doesn't mislabel a console session.
+        plat = self.last_game_plat.get(friend) or self.plat.get(friend)
+        self.on_game_cb(friend, title, start, end, _mins(start, end), plat)
 
     def set_online(self, friend, is_on, ts):
         self.online[friend] = bool(is_on)
@@ -186,17 +206,45 @@ class Engine:
         # / in_game only decide WHICH game while already online, so a stale
         # now_playing can never manufacture Xbox time when online says off.
         title = self.np.get(friend); ig = self.ig.get(friend)
-        # Count ACTUAL gameplay wherever the account plays it — Xbox console or a
-        # game run through the Xbox app on a PC. We do NOT exclude by platform:
-        # the thing to exclude is mere account-online presence with no game, and
-        # requiring a title + in_game already does that. platform is captured only
-        # for the diagnostic log.
-        recording = self.online.get(friend) is True and title is not None and ig is not False
-        if recording:
+        plat = self.plat.get(friend)
+        online = self.online.get(friend) is True
+
+        # A genuine "in a game right now" reading: online, a title, and in_game not
+        # explicitly off. This is the only thing that advances the last-game marker.
+        active = online and title is not None and ig is not False
+        if active:
+            self.last_game[friend] = title
+            self.last_game_plat[friend] = plat
+            self._dropped_at.pop(friend, None)
             self.gc.start(friend, title, ts)
+            self._diag(friend, title, ig, True)
+            return
+
+        # No live game reading. It may still be a FALSE stop: HA gives one presence
+        # per kid across all their devices, so an idle Xbox app (party chat on a PC)
+        # or a same-device title flicker keeps flipping the signal to "no game" even
+        # while they play. If a game was open when the signal dropped, keep crediting
+        # it for a short grace measured from that drop, then give up. The grace is
+        # anchored to the drop of the GAME device, so a phantom that stays online
+        # afterwards can't extend it — once the grace lapses the session closes.
+        lg = self.last_game.get(friend)
+        was_open = friend in self.gc.open
+        if online and lg is not None and was_open and friend not in self._dropped_at:
+            self._dropped_at[friend] = ts            # the moment it dropped
+        drop = self._dropped_at.get(friend)
+        held = (
+            online
+            and lg is not None
+            and drop is not None
+            and (ts - drop) <= GAME_HOLD
+        )
+        if held:
+            self.gc.start(friend, lg, ts)
+            self._diag(friend, lg, ig, True)
         else:
+            self._dropped_at.pop(friend, None)
             self.gc.stop(friend, ts)
-        self._diag(friend, title, ig, recording)
+            self._diag(friend, title, ig, False)
 
     def _diag(self, friend, title, ig, recording):
         """Log a deduped state line per friend so a dropped game is explainable."""
@@ -221,10 +269,21 @@ class Engine:
             self._diag_last[friend] = line
             print("  " + line, flush=True)
 
+    def _expire_holds(self, now):
+        # Close any game held past its grace, ending it exactly at the grace
+        # boundary — so a game left open by a phantom that went quiet doesn't linger
+        # until the next event. Skips holds an event already closed.
+        for friend, drop in list(self._dropped_at.items()):
+            if (now - drop) > GAME_HOLD:
+                self._dropped_at.pop(friend, None)
+                self.gc.stop(friend, drop + GAME_HOLD)
+
     def flush(self, now):
+        self._expire_holds(now)
         self.oc.flush_expired(now); self.gc.flush_expired(now)
 
     def flush_all(self, now):
+        self._expire_holds(now)
         self.oc.flush_all(now); self.gc.flush_all(now)
 
     def live_online(self, now):
@@ -693,7 +752,7 @@ def selftest():
     M = lambda n: t + timedelta(minutes=n)
     o, g = [], []
     eng = Engine(lambda f, s, e, m: o.append((f, round(m))),
-                 lambda f, ga, s, e, m: g.append((f, ga, round(m))))
+                 lambda f, ga, s, e, m, plat=None: g.append((f, ga, round(m))))
     eng.set_online("Ethan", True, M(0)); eng.set_now_playing("Ethan", "Grounded", M(2))
     eng.set_in_game("Ethan", True, M(2)); eng.set_online("Ethan", False, M(20))
     eng.set_online("Ethan", True, M(21)); eng.set_last_online("Ethan", M(49))
