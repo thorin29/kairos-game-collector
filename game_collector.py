@@ -6,10 +6,12 @@ Sources feed one coalescing session engine:
   * Xbox (Home Assistant Xbox integration, WebSocket)
   * Steam (direct Steam Web API poll) — for Steam-primary kids
 
-It records TIME ON XBOX (online) + GAME BREAKDOWN with coalescing,
-in_game+now_playing game sessions, and a last_online end cross-check; and it
-reads each kid's profile status (gamerscore, Game Pass, gamerpic from Xbox;
-Microsoft spending balance from Family Safety sensors).
+The daily total each kid is credited is their actual GAME-session time (in_game +
+now_playing, with coalescing and an 8-minute Xbox reconnect bridge). Xbox-Network
+"online" presence is recorded too but kept only as a diagnostic — a kid who is
+merely online with no game running counts zero. It also reads each kid's profile
+status (gamerscore, Game Pass, gamerpic from Xbox; Microsoft spending balance from
+Family Safety sensors).
 
 On a schedule it computes the RESOLVED per-person daily rollups (Steam-primary
 merge applied) + status and POSTs them to Kairos's ingest endpoint. Kairos owns
@@ -25,7 +27,7 @@ Env:
 Usage: run live | --summary | --selftest
 """
 from __future__ import annotations
-import asyncio, json, os, re, sqlite3, sys, urllib.parse, urllib.request
+import asyncio, json, os, re, signal, sqlite3, sys, urllib.parse, urllib.request
 from datetime import datetime, timezone, timedelta
 try:
     from zoneinfo import ZoneInfo
@@ -38,15 +40,15 @@ except Exception:
 
 UNSET = {"", "none", "unknown", "unavailable"}
 COALESCE_GAP = timedelta(minutes=5)
-# When the game signal drops (title -> None or in_game -> off) but the account is
-# still shown online, keep crediting the LAST game this long past its last real
-# sighting, then give up. This rides out title flicker, brief menus/load screens,
-# and party chat stealing the "now playing" slot on the same PC. It is measured
-# from the last genuine game ping (a phantom device idling online never advances
-# that), so an Xbox app left open in party chat can't run the clock up: the grace
-# expires and the game closes. Kept short because the kids sign off soon after they
-# actually stop — a long online tail is the idle app, not play. Tune via env.
-GAME_HOLD = timedelta(minutes=int(os.environ.get("GAME_HOLD_MIN", "5")))
+# How long a game session stays reconnectable after the game signal drops. If the
+# SAME game is confirmed again within this window, the two pieces are joined and
+# the gap between them is counted as play (evidence-based: the kid was in the game
+# before and after). If it does NOT come back, the session is finalized at the drop
+# and NO extra time is added. Xbox presence for a PC/console can blink offline for
+# several minutes mid-game, so the Xbox *game* window is wider than the online-
+# diagnostic window; Steam reports the title directly and keeps the tighter default
+# so a real Steam break isn't swallowed. Tune the Xbox game window via env.
+XBOX_GAME_GAP = timedelta(minutes=int(os.environ.get("XBOX_GAME_GAP_MIN", "8")))
 FLUSH_INTERVAL = 20
 STEAM_POLL = 60
 PUSH_INTERVAL = 300   # push rollups+status to Kairos every 5 min
@@ -102,12 +104,18 @@ def fmt_balance(v):
 
 # ---------------------------------------------------------------- coalescer
 class Coalescer:
-    def __init__(self, on_emit):
+    def __init__(self, on_emit, gap=COALESCE_GAP):
         self.on_emit = on_emit
-        self.open: dict[str, tuple[str, datetime]] = {}
-        self.pending: dict[str, tuple[str, datetime, datetime]] = {}
+        self.gap = gap
+        # open:    friend -> (label, start, meta)
+        # pending: friend -> (label, start, end, meta)
+        # `meta` (e.g. the platform a game is on) is captured when the session opens
+        # and travels with THAT session — it is never overwritten mid-session or by a
+        # later different session, and a bridge keeps the original session's meta.
+        self.open: dict[str, tuple] = {}
+        self.pending: dict[str, tuple] = {}
 
-    def start(self, friend, label, ts):
+    def start(self, friend, label, ts, meta=None):
         o = self.open.get(friend)
         if o and o[0] == label:
             return
@@ -115,21 +123,21 @@ class Coalescer:
             self.stop(friend, ts)
         p = self.pending.get(friend)
         if p:
-            if p[0] == label and (ts - p[2]) <= COALESCE_GAP:
-                self.open[friend] = (p[0], p[1]); del self.pending[friend]; return
+            if p[0] == label and (ts - p[2]) <= self.gap:
+                self.open[friend] = (p[0], p[1], p[3]); del self.pending[friend]; return
             self._flush(friend)
-        self.open[friend] = (label, ts)
+        self.open[friend] = (label, ts, meta)
 
     def stop(self, friend, ts):
         o = self.open.pop(friend, None)
         if o:
             if friend in self.pending:
                 self._flush(friend)
-            self.pending[friend] = (o[0], o[1], ts)
+            self.pending[friend] = (o[0], o[1], ts, o[2])
 
     def flush_expired(self, now):
         for friend in list(self.pending):
-            if (now - self.pending[friend][2]) > COALESCE_GAP:
+            if (now - self.pending[friend][2]) > self.gap:
                 self._flush(friend)
 
     def flush_all(self, now):
@@ -141,12 +149,12 @@ class Coalescer:
     def _flush(self, friend):
         p = self.pending.pop(friend, None)
         if p:
-            self.on_emit(friend, p[0], p[1], p[2])
+            self.on_emit(friend, p[0], p[1], p[2], p[3])
 
 
 # ---------------------------------------------------------------- engine
 class Engine:
-    def __init__(self, on_online, on_game, use_last_online=True, label=None):
+    def __init__(self, on_online, on_game, use_last_online=True, label=None, game_gap=COALESCE_GAP):
         self.on_online_cb = on_online
         self.on_game_cb = on_game
         self.label = label          # set (e.g. "xbox") to log state transitions
@@ -157,29 +165,20 @@ class Engine:
         self.plat: dict[str, str | None] = {}
         self.ig: dict[str, bool | None] = {}
         self.online: dict[str, bool] = {}   # authoritative ONLINE-sensor state
-        # Last GENUINE game sighting per friend (title + the device it was on), and
-        # the moment the live signal dropped while a game was open. The hold in
-        # _recompute is measured from that drop moment — anchored to the game
-        # device, never refreshed by a phantom device idling online — so an idle
-        # second device can neither break an active session nor hold a dead one open.
-        self.last_game: dict[str, str] = {}
-        self.last_game_plat: dict[str, str | None] = {}
-        self._dropped_at: dict[str, datetime] = {}
-        self.oc = Coalescer(self._emit_online)
-        self.gc = Coalescer(self._emit_game)
+        self.oc = Coalescer(self._emit_online)                # online: default gap
+        self.gc = Coalescer(self._emit_game, gap=game_gap)    # game: reconnect window
 
-    def _emit_online(self, friend, label, start, end):
+    def _emit_online(self, friend, label, start, end, meta=None):
         if self.use_last_online:
             lo = self.last_online.get(friend)
             if lo and start <= lo <= end:
                 end = lo
         self.on_online_cb(friend, start, end, _mins(start, end))
 
-    def _emit_game(self, friend, title, start, end):
-        # Prefer the platform the game was actually seen on, so a phantom PC that
-        # held the "now playing" slot last doesn't mislabel a console session.
-        plat = self.last_game_plat.get(friend) or self.plat.get(friend)
-        self.on_game_cb(friend, title, start, end, _mins(start, end), plat)
+    def _emit_game(self, friend, title, start, end, meta=None):
+        # `meta` is the platform captured when THIS session opened, so it can't be
+        # overwritten by a later different game/device.
+        self.on_game_cb(friend, title, start, end, _mins(start, end), meta)
 
     def set_online(self, friend, is_on, ts):
         self.online[friend] = bool(is_on)
@@ -206,45 +205,17 @@ class Engine:
         # / in_game only decide WHICH game while already online, so a stale
         # now_playing can never manufacture Xbox time when online says off.
         title = self.np.get(friend); ig = self.ig.get(friend)
-        plat = self.plat.get(friend)
-        online = self.online.get(friend) is True
-
-        # A genuine "in a game right now" reading: online, a title, and in_game not
-        # explicitly off. This is the only thing that advances the last-game marker.
-        active = online and title is not None and ig is not False
-        if active:
-            self.last_game[friend] = title
-            self.last_game_plat[friend] = plat
-            self._dropped_at.pop(friend, None)
-            self.gc.start(friend, title, ts)
-            self._diag(friend, title, ig, True)
-            return
-
-        # No live game reading. It may still be a FALSE stop: HA gives one presence
-        # per kid across all their devices, so an idle Xbox app (party chat on a PC)
-        # or a same-device title flicker keeps flipping the signal to "no game" even
-        # while they play. If a game was open when the signal dropped, keep crediting
-        # it for a short grace measured from that drop, then give up. The grace is
-        # anchored to the drop of the GAME device, so a phantom that stays online
-        # afterwards can't extend it — once the grace lapses the session closes.
-        lg = self.last_game.get(friend)
-        was_open = friend in self.gc.open
-        if online and lg is not None and was_open and friend not in self._dropped_at:
-            self._dropped_at[friend] = ts            # the moment it dropped
-        drop = self._dropped_at.get(friend)
-        held = (
-            online
-            and lg is not None
-            and drop is not None
-            and (ts - drop) <= GAME_HOLD
-        )
-        if held:
-            self.gc.start(friend, lg, ts)
-            self._diag(friend, lg, ig, True)
+        recording = self.online.get(friend) is True and title is not None and ig is not False
+        if recording:
+            # Capture the device on the session as it opens; the coalescer keeps it
+            # with that session so a later game/device can't relabel it.
+            self.gc.start(friend, title, ts, self.plat.get(friend))
         else:
-            self._dropped_at.pop(friend, None)
+            # Stop at the drop and hold it pending. If the SAME game returns within
+            # the reconnect window the coalescer rejoins the pieces and counts the
+            # gap; if it never returns, the session finalizes here with nothing added.
             self.gc.stop(friend, ts)
-            self._diag(friend, title, ig, False)
+        self._diag(friend, title, ig, recording)
 
     def _diag(self, friend, title, ig, recording):
         """Log a deduped state line per friend so a dropped game is explainable."""
@@ -269,33 +240,34 @@ class Engine:
             self._diag_last[friend] = line
             print("  " + line, flush=True)
 
-    def _expire_holds(self, now):
-        # Close any game held past its grace, ending it exactly at the grace
-        # boundary — so a game left open by a phantom that went quiet doesn't linger
-        # until the next event. Skips holds an event already closed.
-        for friend, drop in list(self._dropped_at.items()):
-            if (now - drop) > GAME_HOLD:
-                self._dropped_at.pop(friend, None)
-                self.gc.stop(friend, drop + GAME_HOLD)
-
     def flush(self, now):
-        self._expire_holds(now)
         self.oc.flush_expired(now); self.gc.flush_expired(now)
 
     def flush_all(self, now):
-        self._expire_holds(now)
         self.oc.flush_all(now); self.gc.flush_all(now)
+
+    def suspend(self, now):
+        # For a TRANSIENT loss of the source (e.g. the HA WebSocket dropping): stop
+        # open sessions into PENDING at `now` but do NOT flush pending. If the same
+        # game is confirmed again within the reconnect window the coalescer rejoins
+        # the pieces; if the outage outlasts the window the normal flush loop expires
+        # them. Unlike flush_all (a deliberate exit), this preserves the bridge.
+        for friend in list(self.oc.open):
+            self.oc.stop(friend, now)
+        for friend in list(self.gc.open):
+            self.gc.stop(friend, now)
 
     def live_online(self, now):
         """In-progress online sessions not yet written: open ones end at `now`,
         pending (recently closed, awaiting the coalesce flush) keep their end."""
-        out = [(f, st, now) for f, (lbl, st) in self.oc.open.items()]
-        out += [(f, st, en) for f, (lbl, st, en) in self.oc.pending.items()]
+        out = [(f, st, now) for f, (lbl, st, meta) in self.oc.open.items()]
+        out += [(f, st, en) for f, (lbl, st, en, meta) in self.oc.pending.items()]
         return out
 
     def live_games(self, now):
-        out = [(f, title, st, now) for f, (title, st) in self.gc.open.items()]
-        out += [(f, title, st, en) for f, (title, st, en) in self.gc.pending.items()]
+        # Each row carries the platform captured on that session (the 4th tuple slot).
+        out = [(f, title, st, now, meta) for f, (title, st, meta) in self.gc.open.items()]
+        out += [(f, title, st, en, meta) for f, (title, st, en, meta) in self.gc.pending.items()]
         return out
 
 
@@ -338,13 +310,6 @@ class Store:
     def game_rows(self):
         return self.db.execute("SELECT friend,source,game,start_utc,end_utc,minutes,platform FROM game_sessions").fetchall()
 
-    def platforms_by_friend(self) -> dict:
-        out: dict[str, set] = {}
-        for tbl in ("online_sessions", "game_sessions"):
-            for friend, source in self.db.execute(f"SELECT DISTINCT friend, source FROM {tbl}").fetchall():
-                out.setdefault(friend, set()).add(source)
-        return out
-
     def prune(self, days: int) -> int:
         """Delete sessions older than `days` and reclaim space. The local DB is
         only a buffer (Kairos keeps the real history), so old rows aren't needed
@@ -365,7 +330,7 @@ class Store:
 # ---------------------------------------------------------------- resolver + rollups
 def resolve_precedence(intervals):
     pts = sorted(set([i[0] for i in intervals] + [i[1] for i in intervals]))
-    per_game, total = {}, 0.0
+    per_game, per_source, per_game_plat, total = {}, {}, {}, 0.0
     for a, b in zip(pts, pts[1:]):
         if b <= a:
             continue
@@ -374,9 +339,14 @@ def resolve_precedence(intervals):
             continue
         win = max(cov, key=lambda i: i[3])
         mins = (b - a).total_seconds() / 60.0
-        per_game[win[2]] = per_game.get(win[2], 0.0) + mins
+        g = win[2]
+        per_game[g] = per_game.get(g, 0.0) + mins
+        src = win[4] if len(win) > 4 else None      # source of the WINNING interval
+        if src is not None:
+            per_source[src] = per_source.get(src, 0.0) + mins
+        per_game_plat[g] = win[5] if len(win) > 5 else None   # platform of the winner
         total += mins
-    return total, per_game
+    return total, per_game, per_source, per_game_plat
 
 
 def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None):
@@ -412,25 +382,26 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
     out = {}
     for friend in set(online) | set(games):
         rows = games.get(friend, [])
-        # A game's platform for the day (last non-null session wins).
-        plat_by_game: dict[str, str | None] = {}
-        for (src, g, plat, s, e) in rows:
-            if plat:
-                plat_by_game[g] = plat
         if friend in steam_friends:
-            intervals = [(s, e, g, 2 if src == "steam" else 1) for (src, g, plat, s, e) in rows]
-            tot, per = resolve_precedence(intervals)
+            intervals = [(s, e, g, 2 if src == "steam" else 1, src, plat) for (src, g, plat, s, e) in rows]
+            tot, per, psrc, pplat = resolve_precedence(intervals)
         else:
             # Xbox time is actual gameplay, not account-online presence. Xbox
             # Network "online" can be a PC Xbox app, Game Pass, or lingering
             # presence with no game running, so a kid who is merely online must
             # log 0. Total = union of the kid's Xbox game sessions (the same
             # basis Steam-primary uses); online_sessions stay for diagnostics.
-            intervals = [(s, e, g, 1) for (src, g, plat, s, e) in rows if src == "xbox"]
-            tot, per = resolve_precedence(intervals)
+            intervals = [(s, e, g, 1, src, plat) for (src, g, plat, s, e) in rows if src == "xbox"]
+            tot, per, psrc, pplat = resolve_precedence(intervals)
+        # Sources and per-game platform both come from the WINNERS of the precedence
+        # merge, not from every source/row that shared a title. So a Steam game that
+        # also surfaces under Xbox presence at the same instant shows Steam only with
+        # no Xbox device attached; a genuinely separate Xbox/Game Pass game shows Xbox.
+        sources = sorted(sc for sc, mn in psrc.items() if round(mn) > 0)
         out[friend] = {
             "friend": friend, "date": today, "minutes": round(tot),
-            "games": [{"game": g, "minutes": round(mn), "platform": plat_by_game.get(g)} for g, mn in per.items() if round(mn) > 0],
+            "games": [{"game": g, "minutes": round(mn), "platform": pplat.get(g)} for g, mn in per.items() if round(mn) > 0],
+            "sources": sources,
         }
     return out
 
@@ -449,7 +420,7 @@ class Client:
         self.np: dict[str, str] = {}; self.lo: dict[str, str] = {}
         self.gs: dict[str, str] = {}; self.gp: dict[str, str] = {}; self.bal: dict[str, str] = {}
         self.status: dict[str, dict] = {}
-        self.xbox = Engine(self._mk_online("xbox"), self._mk_game("xbox"), use_last_online=True, label="xbox")
+        self.xbox = Engine(self._mk_online("xbox"), self._mk_game("xbox"), use_last_online=True, label="xbox", game_gap=XBOX_GAME_GAP)
         self.steam = Engine(self._mk_online("steam"), self._mk_game("steam"), use_last_online=False)
 
     def _set_status(self, friend, key, val):
@@ -483,28 +454,95 @@ class Client:
     async def run(self):
         if websockets is None:
             sys.exit("Missing dependency: pip install websockets")
-        asyncio.create_task(self._flush_loop())
-        asyncio.create_task(self._prune_loop())
+        self._stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            try:
+                loop.add_signal_handler(sig, self._stop.set)
+            except (NotImplementedError, RuntimeError):
+                pass  # signal handlers aren't available on every platform
+        bg = [asyncio.create_task(self._flush_loop()),
+              asyncio.create_task(self._prune_loop())]
         if self.steam_key and self.steam_ids:
-            asyncio.create_task(self._steam_loop())
+            bg.append(asyncio.create_task(self._steam_loop()))
             print(f"[+] Steam enabled for: {sorted(self.steam_ids)} (Steam-primary)", flush=True)
         if self.kairos_url and self.ingest_token:
-            asyncio.create_task(self._push_loop())
+            bg.append(asyncio.create_task(self._push_loop()))
             print(f"[+] Kairos push enabled -> {self.kairos_url}/api/v1/game-time/ingest", flush=True)
+        try:
+            await self._serve()               # runs until SIGTERM/SIGINT sets _stop
+        finally:
+            for t in bg:
+                t.cancel()
+            # Let the cancellations settle (their still-running HTTP calls are bounded
+            # by the short per-request timeouts, not by this await).
+            await asyncio.gather(*bg, return_exceptions=True)
+            await self._graceful_shutdown()
+
+    async def _serve(self):
         if not self.ws_url:
-            while True:
-                await asyncio.sleep(3600)
+            await self._stop.wait()
+            return
         backoff = 2
-        while True:
+        while not self._stop.is_set():
             try:
                 async with websockets.connect(self.ws_url, max_size=8_000_000) as ws:
                     await self._auth(ws); await self._discover(ws); await self._snapshot(ws)
                     backoff = 2
-                    await self._listen(ws)
+                    listen = asyncio.ensure_future(self._listen(ws))
+                    stopw = asyncio.ensure_future(self._stop.wait())
+                    done, pending = await asyncio.wait({listen, stopw}, return_when=asyncio.FIRST_COMPLETED)
+                    for t in pending:
+                        t.cancel()
+                        try:
+                            await t
+                        except BaseException:
+                            pass
+                    if listen in done:
+                        listen.result()       # re-raise a socket error to reconnect
             except Exception as e:
-                self.xbox.flush_all(datetime.now(timezone.utc))
+                if self._stop.is_set():
+                    break
+                # A dropped HA socket is transient: suspend open Xbox sessions into
+                # pending (bridgeable) rather than committing them, so if HA
+                # reconnects and the same game is still running within the reconnect
+                # window it rejoins seamlessly. A longer outage lets the pending
+                # expire normally, ending the session at the disconnect with no
+                # invented time.
+                self.xbox.suspend(datetime.now(timezone.utc))
                 print(f"[!] HA disconnected: {e} — retry in {backoff}s", flush=True)
-                await asyncio.sleep(backoff); backoff = min(backoff * 2, 60)
+                try:
+                    await asyncio.wait_for(self._stop.wait(), timeout=backoff)
+                except asyncio.TimeoutError:
+                    pass
+                backoff = min(backoff * 2, 60)
+
+    async def _graceful_shutdown(self):
+        # On a normal Docker stop/restart/update (SIGTERM) or Ctrl-C (SIGINT):
+        # 1) finalize every open/pending session INTO SQLite at the shutdown time.
+        #    A deliberate restart is not a presence blip, so it does NOT enter the
+        #    8-minute reconnect bridge — the session simply ends here and is saved.
+        now = datetime.now(timezone.utc)
+        try:
+            self.xbox.flush_all(now); self.steam.flush_all(now)
+        except Exception as e:
+            print(f"[!] shutdown flush failed: {e}", flush=True)
+        # 2) one best-effort push so Kairos reflects the just-finalized totals right
+        #    away. SQLite is the safety net: a failed or slow push must never block
+        #    shutdown or alter the persisted rows — the restarted collector will send
+        #    them on its next cycle. Bounded under Docker's default stop grace.
+        if self.kairos_url and self.ingest_token:
+            try:
+                # The HTTP op itself must use a short timeout — an outer wait_for
+                # can stop *waiting* but can't kill the worker thread, and
+                # asyncio.run() blocks on that thread at exit. 5s keeps us well
+                # inside Docker's stop grace; the wait_for is a second guard.
+                resp = await asyncio.wait_for(
+                    asyncio.to_thread(self._post, self._build_payload(), 5), timeout=7)
+                print(f"[+] final push on shutdown: matched={resp.get('matched')}", flush=True)
+            except Exception as e:
+                print(f"[!] final push skipped ({e}); sessions are safe in SQLite", flush=True)
+        print("[+] graceful shutdown complete", flush=True)
 
     async def _flush_loop(self):
         while True:
@@ -663,7 +701,7 @@ class Client:
                 # from a worker thread is what caused the "SQLite objects created
                 # in a thread can only be used in that same thread" failures.
                 payload = self._build_payload()
-                resp = await asyncio.to_thread(self._post, payload)
+                resp = await asyncio.to_thread(self._post, payload, 5)
                 print(f"[+] pushed to Kairos: matched={resp.get('matched')} unmatched={resp.get('unmatched')}", flush=True)
             except Exception as e:
                 print(f"[!] Kairos push failed: {e}", flush=True)
@@ -673,44 +711,36 @@ class Client:
         now = datetime.now(timezone.utc)
         extra_online = ([(f, "xbox", s, e) for (f, s, e) in self.xbox.live_online(now)]
                         + [(f, "steam", s, e) for (f, s, e) in self.steam.live_online(now)])
-        extra_games = ([(f, "xbox", g, s, e, self.xbox.plat.get(f)) for (f, g, s, e) in self.xbox.live_games(now)]
-                       + [(f, "steam", g, s, e, None) for (f, g, s, e) in self.steam.live_games(now)])
+        extra_games = ([(f, "xbox", g, s, e, plat) for (f, g, s, e, plat) in self.xbox.live_games(now)]
+                       + [(f, "steam", g, s, e, None) for (f, g, s, e, plat) in self.steam.live_games(now)])
         days = compute_daily(self.store, self.tz, set(self.steam_ids), extra_online, extra_games)
         for friend in self.status:                       # include status even with no play today
             days.setdefault(friend, {"friend": friend, "date": today, "minutes": 0, "games": []})
-        # Which systems each kid actually uses (for the per-system icon). Start from
-        # recorded + live sessions; the Steam-primary kid shows Steam only, since
-        # their overlapping Xbox time is suppressed in the merge anyway.
-        plats = self.store.platforms_by_friend()
-        for f, _s, _e in self.xbox.live_online(now):
-            plats.setdefault(f, set()).add("xbox")
-        for f, _s, _e in self.steam.live_online(now):
-            plats.setdefault(f, set()).add("steam")
-        steam_friends = set(self.steam_ids)
+        # Platform icons = the sources that actually earned credited game time today
+        # (from compute_daily), not "seen anywhere in the DB retention window." A kid
+        # merely online with no game shows no icon; one who genuinely played both
+        # Xbox and Steam today shows both.
         for friend in days:
-            srcs = set(plats.get(friend, set()))
-            if friend in steam_friends:
-                srcs.discard("xbox")
-                srcs.add("steam")
+            srcs = days[friend].pop("sources", [])
             if srcs:
-                days[friend]["platforms"] = sorted(srcs)
+                days[friend]["platforms"] = srcs
             if friend in self.status:
                 days[friend]["status"] = self.status[friend]
         return {"days": list(days.values())}
 
-    def _post(self, payload: dict) -> dict:
+    def _post(self, payload: dict, timeout: int = 20) -> dict:
         data = json.dumps(payload).encode()
         req = urllib.request.Request(
             self.kairos_url + "/api/v1/game-time/ingest", data=data, method="POST",
             headers={"Content-Type": "application/json", "X-Ingest-Token": self.ingest_token,
                      "User-Agent": "kairos-game-collector"})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
             return json.loads(r.read().decode())
 
     @staticmethod
     def _get_json(url):
         req = urllib.request.Request(url, headers={"User-Agent": "kairos-game-collector"})
-        with urllib.request.urlopen(req, timeout=20) as r:
+        with urllib.request.urlopen(req, timeout=8) as r:   # short: Steam re-polls every minute
             return json.loads(r.read().decode())
 
 
@@ -762,8 +792,23 @@ def selftest():
 
     intervals = [(M(0), M(60), "Grounded", 2), (M(30), M(45), "Grounded", 1),
                  (M(70), M(80), "Grounded", 1), (M(90), M(100), "Halo", 1)]
-    tot, per = resolve_precedence(intervals)
+    tot, per, _, _ = resolve_precedence(intervals)
     assert round(tot) == 80 and round(per["Grounded"]) == 70 and round(per["Halo"]) == 10, (tot, per)
+
+    # source precedence: same title, same interval, Steam outranks Xbox -> Xbox earns
+    # ZERO credited minutes, so it must NOT appear as a platform source.
+    _t, _p, psrc, _ = resolve_precedence([(M(0), M(60), "Grounded", 2, "steam"),
+                                       (M(0), M(60), "Grounded", 1, "xbox")])
+    assert round(_t) == 60 and round(psrc.get("steam", 0)) == 60 and psrc.get("xbox", 0) == 0, psrc
+    # genuinely separate Steam + Xbox play -> both sources credited.
+    _t, _p, psrc, _ = resolve_precedence([(M(0), M(60), "DeepRock", 2, "steam"),
+                                       (M(90), M(120), "Grounded", 1, "xbox")])
+    assert sorted(sc for sc, mn in psrc.items() if round(mn) > 0) == ["steam", "xbox"], psrc
+    # ...and the game's displayed platform follows the winner: Steam wins the shared
+    # Grounded interval, so no lost Xbox/Windows device is attached to it.
+    _t, _p, _ps, pplat = resolve_precedence([(M(0), M(60), "Grounded", 2, "steam", None),
+                                             (M(0), M(60), "Grounded", 1, "xbox", "Windows")])
+    assert pplat.get("Grounded") is None, pplat
 
     assert fmt_balance("12.50") == "$12.50"
     assert fmt_balance("$8") == "$8.00"
@@ -779,6 +824,92 @@ def selftest():
     days = compute_daily(st, timezone.utc, set())
     assert days["P2"]["minutes"] == 0, days["P2"]
     assert days["P3"]["minutes"] == 53, days["P3"]
+
+    # --- regression: P1's real 2026-09-18 Grounded session ---------------
+    # Confirmed Grounded 17:19:55, then Xbox presence blinked fully offline twice
+    # mid-game (6m27s and 5m16s — both over the 5-min online window), then the game
+    # signal ended at 18:06:06 for good while the account lingered online (party
+    # chat) until 18:42. The two mid-game outages must be BRIDGED (game returned) and
+    # counted; the post-18:06 online tail must add NOTHING. Expected ~46.2 min.
+    eg = []
+    eng2 = Engine(lambda *_: None,
+                  lambda f, ga, s, e, m, plat=None: eg.append(round(m, 2)),
+                  use_last_online=False, game_gap=XBOX_GAME_GAP)
+    D = lambda h, mi, s=0: datetime(2026, 9, 18, h, mi, s, tzinfo=timezone.utc)
+    def gon(h, mi, s=0):   # online + Grounded + in_game all on
+        eng2.set_online("E", True, D(h, mi, s))
+        eng2.set_now_playing("E", "Grounded", D(h, mi, s), "Windows")
+        eng2.set_in_game("E", True, D(h, mi, s))
+    def goff(h, mi, s=0):  # account drops offline (title/in_game clear too)
+        eng2.set_now_playing("E", None, D(h, mi, s), "Windows")
+        eng2.set_in_game("E", False, D(h, mi, s))
+        eng2.set_online("E", False, D(h, mi, s))
+    gon(17, 19, 55)
+    goff(17, 39, 33)                 # gap 1 (6m27s) — bridge on return
+    gon(17, 46, 0)
+    goff(17, 52, 7)                  # gap 2 (5m16s) — bridge on return
+    gon(17, 57, 23)
+    eng2.set_in_game("E", False, D(18, 6, 6))       # game really ends here…
+    eng2.set_now_playing("E", None, D(18, 6, 6), "Windows")
+    eng2.set_online("E", False, D(18, 42, 0))       # …account lingered, then off
+    eng2.flush_all(D(20, 0, 0))
+    total = round(sum(eg), 1)
+    assert len(eg) == 1 and 45.5 <= total <= 47.0, (eg, total)  # one joined session
+
+    # --- regression: the 8-minute game reconnect window itself --------------
+    # Bridge iff the SAME game returns within the window; never invent time.
+    def sim(seq):
+        got = []
+        e = Engine(lambda *_: None,
+                   lambda f, ga, s, en, mn, plat=None: got.append((ga, round(mn))),
+                   use_last_online=False, game_gap=timedelta(minutes=8))
+        T = lambda mins: datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=mins)
+        e.set_online("K", True, T(0))
+        for mins, game in seq:
+            e.set_now_playing("K", game, T(mins), "Xbox One")
+            e.set_in_game("K", game is not None, T(mins))
+        e.flush_all(T(seq[-1][0] + 60))
+        return got
+    assert sim([(0, "Grounded"), (10, None), (17, "Grounded"), (25, None)]) == [("Grounded", 25)], "7-min gap must bridge"
+    assert sim([(0, "Grounded"), (10, None), (19, "Grounded"), (25, None)]) == [("Grounded", 10), ("Grounded", 6)], "9-min gap must NOT bridge"
+    assert sim([(0, "Grounded"), (10, None)]) == [("Grounded", 10)], "no return -> add nothing"
+    assert sim([(0, "Grounded"), (10, None), (17, "Halo"), (25, None)]) == [("Grounded", 10), ("Halo", 8)], "different game -> gap not counted"
+
+    # --- regression: transient HA disconnect preserves the bridge ------------
+    # A dropped WebSocket calls suspend() (stop open -> pending, don't flush), so a
+    # reconnect that re-lands the same game within the window rejoins across it.
+    def sim_ha(gap_min, game2="Grounded"):
+        got = []
+        e = Engine(lambda *_: None,
+                   lambda f, ga, s, en, mn, plat=None: got.append((ga, round(mn))),
+                   use_last_online=False, game_gap=timedelta(minutes=8))
+        T = lambda mins: datetime(2026, 1, 1, tzinfo=timezone.utc) + timedelta(minutes=mins)
+        e.set_online("K", True, T(0)); e.set_now_playing("K", "Grounded", T(0), "Xbox One"); e.set_in_game("K", True, T(0))
+        e.suspend(T(20))                                            # HA socket drops
+        r = 20 + gap_min                                           # reconnect snapshot order: np/ig, then online
+        e.set_now_playing("K", game2, T(r), "Xbox One"); e.set_in_game("K", True, T(r)); e.set_online("K", True, T(r))
+        e.set_now_playing("K", None, T(r + 10), "Xbox One"); e.set_in_game("K", False, T(r + 10))
+        e.flush_all(T(r + 80))
+        return got
+    assert sim_ha(2) == [("Grounded", 32)], "HA reconnect 2 min -> one continuous session"
+    assert sim_ha(9) == [("Grounded", 20), ("Grounded", 10)], "HA reconnect 9 min -> gap excluded"
+    assert sim_ha(2, "Halo") == [("Grounded", 20), ("Halo", 10)], "HA reconnect to different game -> no bridge"
+
+    # --- regression: platform metadata belongs to the SESSION -----------------
+    # Grounded (Xbox One) stops -> pending; Halo (Windows) starts 2 min later, before
+    # Grounded flushes. Grounded must stay Xbox One; Halo must be Windows — the later
+    # game/device must not relabel the pending session.
+    got2 = []
+    e2 = Engine(lambda *_: None,
+                lambda f, ga, s, en, mn, plat=None: got2.append((ga, round(mn), plat)),
+                use_last_online=False, game_gap=timedelta(minutes=8))
+    T2 = lambda mins: datetime(2026, 2, 1, tzinfo=timezone.utc) + timedelta(minutes=mins)
+    e2.set_online("K", True, T2(0)); e2.set_now_playing("K", "Grounded", T2(0), "Xbox One"); e2.set_in_game("K", True, T2(0))
+    e2.set_now_playing("K", None, T2(10), "Xbox One"); e2.set_in_game("K", False, T2(10))    # Grounded -> pending
+    e2.set_now_playing("K", "Halo", T2(12), "Windows"); e2.set_in_game("K", True, T2(12))     # Halo starts before flush
+    e2.set_now_playing("K", None, T2(20), "Windows"); e2.set_in_game("K", False, T2(20))
+    e2.flush_all(T2(90))
+    assert ("Grounded", 10, "Xbox One") in got2 and ("Halo", 8, "Windows") in got2, got2
 
     print("selftest OK \u2713")
 
