@@ -19,7 +19,7 @@ the durable history; this container is just the collector.
 
 Env:
   HA_URL, HA_TOKEN                      Home Assistant (Xbox)
-  STEAM_API_KEY, STEAM_IDS             Steam (e.g. STEAM_IDS="P1=765...")
+  STEAM_API_KEY, STEAM_IDS             Steam (e.g. STEAM_IDS="Name=765...")
   KAIROS_URL                           e.g. https://kairos.example.com
   GAMETIME_INGEST_TOKEN                shared secret (same value set on Kairos)
   DB_PATH (./game_playtime.db), TZ_NAME (America/Chicago), ONLY (comma names)
@@ -825,7 +825,7 @@ def selftest():
     assert days["P2"]["minutes"] == 0, days["P2"]
     assert days["P3"]["minutes"] == 53, days["P3"]
 
-    # --- regression: P1's real 2026-09-18 Grounded session ---------------
+    # --- regression: a real multi-outage 2026-09-18 Grounded session --------
     # Confirmed Grounded 17:19:55, then Xbox presence blinked fully offline twice
     # mid-game (6m27s and 5m16s — both over the 5-min online window), then the game
     # signal ended at 18:06:06 for good while the account lingered online (party
