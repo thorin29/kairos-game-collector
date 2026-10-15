@@ -91,6 +91,18 @@ change it without new evidence** (see ROADMAP.md).
   dropped" from "idle with the app open" on the same PC. The bridge recovers
   *same-game* gaps; the residual is an HA-integration limit, not a collector bug.
 
+## Open: Minecraft Java and the shared family PC (Oct 2026)
+
+- **Minecraft Java** produces no Xbox presence and no HA sensor, so the collector
+  cannot see it. The options are hosting the server (log / RCON gives exact
+  joins and leaves per player), Family Safety PC time if it can be read per
+  account, or accepting it as uncounted. Undecided;
+  recorded so nobody builds a heuristic for it in the meantime.
+- **The shared family PC** is the PC case below at its worst: on top of the
+  unreliable `now_playing`, one Windows machine played by several children
+  can't attribute minutes to a child from account presence alone. Accepted as a
+  gap unless a new signal (e.g. per-account Family Safety PC time) turns up.
+
 ## HA collapses multi-device presence — the "phantom" device
 
 - **Observation.** When a kid's account is live on two devices (e.g. a console

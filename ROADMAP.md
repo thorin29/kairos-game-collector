@@ -1,17 +1,33 @@
 # Collector roadmap
 
 Open items, in priority order. The timing/coalescing logic is **frozen** until
-item 1 produces real observation data — don't change it on theory.
+real observation data says otherwise — don't change it on theory.
 
-## 1. Deploy the frozen collector and observe (do this first)
+*Re-baselined 14 Oct 2026. No collector code has changed since 25 Sep.*
 
-The collector compiles and `--selftest` passes, but it has **not** been deployed
-and watched against real play yet. Run a few known play sessions and compare the
-collector's numbers to what the kids actually did. Capture a `device_tracker` /
-`media_player` state trace during a real session for later use. This must happen
-before any further collector code change.
+## 1. Observe against real play (deployed — the check is still to do)
 
-## 2. Physical-console corroboration (future, evidence-gated)
+The collector is deployed (GHCR image, auto-updated on Unraid) and running; the
+Xbox totals Kairos shows come from real game sessions. What hasn't been recorded
+here is a deliberate check: a few known play sessions compared against the
+collector's numbers, and a `device_tracker` / `media_player` state trace captured
+during one for later use. Do that before any further timing change.
+
+## 2. Two gaps that need a decision, not code
+
+- **Minecraft Java Edition is untrackable as things stand.** It doesn't run
+  through Xbox presence and has no sensor in Home Assistant. The options are to
+  host the server ourselves and read its log / RCON for joins and leaves, to
+  lean on Family Safety PC time if it can be read per account, or to accept that
+  it isn't counted. Decision pending with the owner; don't build
+  either until it's made.
+- **PC play through the Xbox app on a shared family PC** doesn't surface
+  reliably in HA — the `now_playing` title drops or shows a non-game on Windows
+  (see DECISIONS, "PC/Windows presence is unreliable"), and a shared PC can't
+  attribute play to one child anyway. Probably no sensor-based fix; treat it as
+  a known gap unless a new signal appears.
+
+## 3. Physical-console corroboration (future, evidence-gated)
 
 HA's Xbox integration can expose each physical console as a `media_player` (power
 state + focused app resolved to a title, ~10s refresh; requires "Remote features"
@@ -29,7 +45,7 @@ enabled on the console). There are also Omada `device_tracker.xbox` /
   is observed (Omada can take minutes to notice a disconnect).
 - **Gate:** don't build until #1 gives real data.
 
-## 3. Midnight-splitting
+## 4. Midnight-splitting
 
 A session that crosses midnight is currently credited entirely to the start day.
 Real bug, but only matters if kids regularly play across 12 AM. Left for later.

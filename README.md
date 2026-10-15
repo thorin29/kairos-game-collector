@@ -31,6 +31,10 @@ alternatives) behind everything below.
   pushes the resolved totals + per-game breakdown + status + platform icons to
   Kairos (idempotent). Buffers everything in SQLite, pruned to `RETAIN_DAYS`.
 
+**Not tracked (open — see ROADMAP.md):** Minecraft Java Edition, which never
+appears in Xbox presence, and play through the Xbox app on a shared family PC,
+which Home Assistant doesn't surface reliably.
+
 ---
 
 ## The detection model (the important part)
