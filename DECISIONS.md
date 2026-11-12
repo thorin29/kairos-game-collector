@@ -2,8 +2,11 @@
 
 Hard-won choices behind `game_collector.py`, each with its rationale and the
 alternative that was tried and rejected. Read this before changing the engine.
-**The timing/coalescing logic is frozen pending real-world observation — do not
-change it without new evidence** (see ROADMAP.md).
+**The timing/coalescing logic has now been observed against real play (Sept 2026)
+and held up — it is credited-session time, not presence.** It stays conservative:
+change it only with evidence from a real observed session, never on theory (see
+ROADMAP.md, which also lists what still can't be seen at all: PC play through the
+Xbox app on a shared computer, and Minecraft Java).
 
 ---
 
@@ -81,6 +84,49 @@ change it without new evidence** (see ROADMAP.md).
   same instant shouldn't attach a phantom Xbox device to the title. A genuinely
   separate Xbox game still surfaces Xbox because it wins its own minutes.
 
+## Presence without a title stays at zero — and the "ally" source
+
+- **Evidence (Nov 2026).** On a day a kid played for hours on a handheld Windows
+  PC, his Xbox `online` sensor flipped `on` 45 times while `now_playing` read
+  `unknown` for all 24 hours — never a title. The collector credited 0, which is
+  correct: crediting presence is what produced the 274-minute phantom day. The
+  blank days were therefore **coverage, not arithmetic**.
+- **Ruled out in the same investigation**, each against real data rather than
+  theory: midnight-splitting (no session in 14 days crossed midnight);
+  the hourly Xbox `unavailable` blips (176 in 7 days, longest 2.7 min, none over
+  the 8-minute bridge — a token refresh the bridge already absorbs); and HA
+  socket drops (brief, and `suspend()` handles them).
+- **Rejected: Microsoft's Xbox daily total as a cross-check.** The Family Safety
+  Screen Time sensor reports 0 for every console-only child; for the child with a
+  managed PC it simply mirrors that device's screen time. There is no independent
+  Xbox ground truth to diff against.
+- **Decision: a third source, `ally`,** reads per-app daily counters from a Family
+  Safety `applications` sensor over the existing HA socket (no new dependency, no
+  new credentials). An app whose counter moved between samples was running; one
+  whose counter stood still was not.
+- **Allowlist only.** `GAME_APPS` names the apps that may ever be credited. A PC
+  reports browsers, launchers and OS utilities with the same kind of counter as a
+  game — one browser accrued 688 minutes in a day purely by being open. Crediting
+  those would be presence by another name. `App=Display` collapses a launcher and
+  its runtime into ONE title so they resolve to a single session.
+- **Credited, with its quality stated.** Ally minutes DO count toward the daily
+  total — otherwise the blank days stay blank and nothing is fixed. But they are
+  *app-open* time at ~5-minute resolution, a weaker signal than a confirmed Xbox
+  or Steam session. It is bounded by the allowlist, so it is not the 274-minute
+  failure mode; it is a deliberate accuracy trade, recorded here as one.
+- **Lowest precedence** (`_PRIO`: steam 2, xbox 1, ally 0). The union total is
+  unaffected by precedence, so a shared minute is still counted once; precedence
+  only decides that a confirmed Steam/Xbox session owns a minute both claim.
+- **A wider bridge: 12 min** (`ALLY_GAME_GAP`). Two consecutive frozen polls span
+  ~10 minutes, which an 8-minute window would false-split. Deliberately looser
+  than Xbox because the input is coarser.
+- **Never invent across a silence.** A delta reported after more than
+  `APP_MAX_GAP` (15 min) is dropped and logged, not credited: the device was off
+  or nothing was listening, so the time cannot be placed. Same principle as the
+  rejected forward grace.
+- **No PII in this repo.** The allowlist, friend names and entity ids all come
+  from env and runtime discovery; nothing identifying is committed.
+
 ## PC/Windows presence is unreliable (irreducible)
 
 - **Observation.** On Windows the `now_playing` title frequently drops to `None`
@@ -90,18 +136,6 @@ change it without new evidence** (see ROADMAP.md).
 - **Consequence.** There is no signal that separates "playing but the title
   dropped" from "idle with the app open" on the same PC. The bridge recovers
   *same-game* gaps; the residual is an HA-integration limit, not a collector bug.
-
-## Open: Minecraft Java and the shared family PC (Oct 2026)
-
-- **Minecraft Java** produces no Xbox presence and no HA sensor, so the collector
-  cannot see it. The options are hosting the server (log / RCON gives exact
-  joins and leaves per player), Family Safety PC time if it can be read per
-  account, or accepting it as uncounted. Undecided;
-  recorded so nobody builds a heuristic for it in the meantime.
-- **The shared family PC** is the PC case below at its worst: on top of the
-  unreliable `now_playing`, one Windows machine played by several children
-  can't attribute minutes to a child from account presence alone. Accepted as a
-  gap unless a new signal (e.g. per-account Family Safety PC time) turns up.
 
 ## HA collapses multi-device presence — the "phantom" device
 

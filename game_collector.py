@@ -1,10 +1,12 @@
 #!/usr/bin/env python3
 """
-Kairos game-time collector — v4 (pushes to Kairos).
+Kairos game-time collector — v5 (pushes to Kairos).
 
 Sources feed one coalescing session engine:
   * Xbox (Home Assistant Xbox integration, WebSocket)
   * Steam (direct Steam Web API poll) — for Steam-primary kids
+  * Ally (handheld/desktop PC app usage, via a Family Safety "applications"
+    sensor in Home Assistant) — allowlisted GAME apps only
 
 The daily total each kid is credited is their actual GAME-session time (in_game +
 now_playing, with coalescing and an 8-minute Xbox reconnect bridge). Xbox-Network
@@ -22,6 +24,15 @@ Env:
   STEAM_API_KEY, STEAM_IDS             Steam (e.g. STEAM_IDS="Name=765...")
   KAIROS_URL                           e.g. https://kairos.example.com
   GAMETIME_INGEST_TOKEN                shared secret (same value set on Kairos)
+  GAME_APPS                            allowlist for the "ally" PC source. Comma
+                                       separated; "App" or "App=Display" to merge
+                                       several processes into one title, e.g.
+                                       GAME_APPS="LauncherX=GameX,runtime=GameX,GameY"
+                                       Empty (default) disables the ally source.
+  ALLY_GAME_GAP_MIN (12)               ally reconnect bridge; wider than Xbox's 8
+                                       because two frozen polls span ~10 min.
+  APP_MAX_GAP_MIN (15)                 ignore an app delta reported after a longer
+                                       gap — it cannot be located in time.
   DB_PATH (./game_playtime.db), TZ_NAME (America/Chicago), ONLY (comma names)
 
 Usage: run live | --summary | --selftest
@@ -39,6 +50,7 @@ except Exception:
     websockets = None
 
 UNSET = {"", "none", "unknown", "unavailable"}
+COLLECTOR_VERSION = "5.0.0"
 COALESCE_GAP = timedelta(minutes=5)
 # How long a game session stays reconnectable after the game signal drops. If the
 # SAME game is confirmed again within this window, the two pieces are joined and
@@ -49,6 +61,13 @@ COALESCE_GAP = timedelta(minutes=5)
 # diagnostic window; Steam reports the title directly and keeps the tighter default
 # so a real Steam break isn't swallowed. Tune the Xbox game window via env.
 XBOX_GAME_GAP = timedelta(minutes=int(os.environ.get("XBOX_GAME_GAP_MIN", "8")))
+# The ally source polls a cumulative daily counter every ~5 min. Two consecutive
+# frozen polls are a ~10 min gap, so an 8-minute bridge would false-split a live
+# session; 12 covers it. Deliberately looser than Xbox and documented as such.
+ALLY_GAME_GAP = timedelta(minutes=int(os.environ.get("ALLY_GAME_GAP_MIN", "12")))
+# A delta reported after a longer silence cannot be placed in time (the device was
+# off, or the collector/HA was down), so it is dropped rather than invented.
+APP_MAX_GAP = timedelta(minutes=int(os.environ.get("APP_MAX_GAP_MIN", "15")))
 FLUSH_INTERVAL = 20
 STEAM_POLL = 60
 PUSH_INTERVAL = 300   # push rollups+status to Kairos every 5 min
@@ -328,6 +347,14 @@ class Store:
 
 
 # ---------------------------------------------------------------- resolver + rollups
+# Source precedence for overlapping minutes. The UNION total is unaffected by
+# these numbers (a shared minute is counted once either way); they only decide
+# which source/title is credited with a minute that two sources both claim.
+# "ally" sits lowest: it is app-OPEN time at ~5-minute resolution, so a confirmed
+# Steam or Xbox session covering the same minute should own it.
+_PRIO = {"steam": 2, "xbox": 1, "ally": 0}
+
+
 def resolve_precedence(intervals):
     pts = sorted(set([i[0] for i in intervals] + [i[1] for i in intervals]))
     per_game, per_source, per_game_plat, total = {}, {}, {}, 0.0
@@ -383,7 +410,7 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
     for friend in set(online) | set(games):
         rows = games.get(friend, [])
         if friend in steam_friends:
-            intervals = [(s, e, g, 2 if src == "steam" else 1, src, plat) for (src, g, plat, s, e) in rows]
+            intervals = [(s, e, g, _PRIO.get(src, 1), src, plat) for (src, g, plat, s, e) in rows]
             tot, per, psrc, pplat = resolve_precedence(intervals)
         else:
             # Xbox time is actual gameplay, not account-online presence. Xbox
@@ -391,7 +418,8 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
             # presence with no game running, so a kid who is merely online must
             # log 0. Total = union of the kid's Xbox game sessions (the same
             # basis Steam-primary uses); online_sessions stay for diagnostics.
-            intervals = [(s, e, g, 1, src, plat) for (src, g, plat, s, e) in rows if src == "xbox"]
+            intervals = [(s, e, g, _PRIO.get(src, 1), src, plat)
+                         for (src, g, plat, s, e) in rows if src in ("xbox", "ally")]
             tot, per, psrc, pplat = resolve_precedence(intervals)
         # Sources and per-game platform both come from the WINNERS of the precedence
         # merge, not from every source/row that shared a title. So a Steam game that
@@ -408,7 +436,8 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
 
 # ---------------------------------------------------------------- client
 class Client:
-    def __init__(self, ha_url, ha_token, store, tz, only, steam_key, steam_ids, kairos_url, ingest_token):
+    def __init__(self, ha_url, ha_token, store, tz, only, steam_key, steam_ids, kairos_url,
+                 ingest_token, game_apps=None):
         self.ws_url = (ha_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
                        + "/api/websocket") if ha_url else None
         self.ha_token, self.store, self.tz, self.only = ha_token, store, tz, only
@@ -419,9 +448,15 @@ class Client:
         self.on: dict[str, str] = {}; self.ig: dict[str, str] = {}
         self.np: dict[str, str] = {}; self.lo: dict[str, str] = {}
         self.gs: dict[str, str] = {}; self.gp: dict[str, str] = {}; self.bal: dict[str, str] = {}
+        self.appsens: dict[str, str] = {}          # Family Safety applications sensor -> friend
+        self.game_apps = game_apps or {}           # lowercased app name -> display title
+        self._app_prev: dict[str, dict[str, float]] = {}   # friend -> app -> last minutes
+        self._app_seen: dict[str, datetime] = {}           # friend -> last applications event
         self.status: dict[str, dict] = {}
         self.xbox = Engine(self._mk_online("xbox"), self._mk_game("xbox"), use_last_online=True, label="xbox", game_gap=XBOX_GAME_GAP)
         self.steam = Engine(self._mk_online("steam"), self._mk_game("steam"), use_last_online=False)
+        self.ally = Engine(self._mk_online("ally"), self._mk_game("ally"),
+                           use_last_online=False, label="ally", game_gap=ALLY_GAME_GAP)
 
     def _set_status(self, friend, key, val):
         if val is not None:
@@ -430,14 +465,14 @@ class Client:
     def _mk_online(self, source):
         def cb(friend, s, e, m):
             self.store.add_online(friend, source, s, e, m)
-            tag = "on xbox " if source == "xbox" else "on steam"
+            tag = {"xbox": "on xbox ", "steam": "on steam", "ally": "on ally "}.get(source, source)
             print(f"  \u25a0 {tag} {friend:<14} {s.astimezone(self.tz):%H:%M}\u2192{e.astimezone(self.tz):%H:%M}  {m:>5.1f} min", flush=True)
         return cb
 
     def _mk_game(self, source):
         def cb(friend, game, s, e, m, platform=None):
             self.store.add_game(friend, source, game, s, e, m, platform)
-            src = "" if source == "xbox" else " (steam)"
+            src = "" if source == "xbox" else f" ({source})"
             print(f"    \u00b7 game   {friend:<14} {game+src:<26} {s.astimezone(self.tz):%H:%M}\u2192{e.astimezone(self.tz):%H:%M}  {m:>5.1f} min", flush=True)
         return cb
 
@@ -454,6 +489,7 @@ class Client:
     async def run(self):
         if websockets is None:
             sys.exit("Missing dependency: pip install websockets")
+        print(f"[+] kairos-game-collector v{COLLECTOR_VERSION}", flush=True)
         self._stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         for sig in (signal.SIGTERM, signal.SIGINT):
@@ -509,7 +545,8 @@ class Client:
                 # window it rejoins seamlessly. A longer outage lets the pending
                 # expire normally, ending the session at the disconnect with no
                 # invented time.
-                self.xbox.suspend(datetime.now(timezone.utc))
+                now_s = datetime.now(timezone.utc)
+                self.xbox.suspend(now_s); self.ally.suspend(now_s)
                 print(f"[!] HA disconnected: {e} — retry in {backoff}s", flush=True)
                 try:
                     await asyncio.wait_for(self._stop.wait(), timeout=backoff)
@@ -524,7 +561,7 @@ class Client:
         #    8-minute reconnect bridge — the session simply ends here and is saved.
         now = datetime.now(timezone.utc)
         try:
-            self.xbox.flush_all(now); self.steam.flush_all(now)
+            self.xbox.flush_all(now); self.steam.flush_all(now); self.ally.flush_all(now)
         except Exception as e:
             print(f"[!] shutdown flush failed: {e}", flush=True)
         # 2) one best-effort push so Kairos reflects the just-finalized totals right
@@ -548,7 +585,7 @@ class Client:
         while True:
             await asyncio.sleep(FLUSH_INTERVAL)
             now = datetime.now(timezone.utc)
-            self.xbox.flush(now); self.steam.flush(now)
+            self.xbox.flush(now); self.steam.flush(now); self.ally.flush(now)
 
     async def _prune_loop(self):
         try:
@@ -604,9 +641,24 @@ class Client:
                     if friend.split()[0].lower() in eid:
                         self.bal[eid] = friend
                         break
+        # Family Safety "applications" sensors (different integration) by first name.
+        # Only wired up when GAME_APPS is set: without an allowlist there is nothing
+        # the ally source is allowed to credit.
+        self.appsens.clear()
+        if self.game_apps:
+            for e in ents:
+                eid = e["entity_id"]
+                if eid.endswith("_applications") and "family_safety" in eid:
+                    for friend in friends:
+                        if friend.split()[0].lower() in eid:
+                            self.appsens[eid] = friend
+                            break
         print(f"[+] tracking {len(friends)} Xbox friend(s): {friends}", flush=True)
         if self.bal:
             print(f"[+] Family Safety balance for: {sorted(set(self.bal.values()))}", flush=True)
+        if self.appsens:
+            print(f"[+] ally PC app usage for: {sorted(set(self.appsens.values()))} "
+                  f"({len(self.game_apps)} allowlisted app(s))", flush=True)
 
     async def _snapshot(self, ws):
         states = {s["entity_id"]: s for s in await self._cmd(ws, {"type": "get_states"})}
@@ -632,6 +684,9 @@ class Client:
             self._set_status(friend, "hasGamePass", _tri(states.get(eid, {}).get("state")))
         for eid, friend in self.bal.items():
             self._set_status(friend, "msBalance", fmt_balance(states.get(eid, {}).get("state")))
+        for eid, friend in self.appsens.items():
+            # Baseline only: _on_apps infers nothing until it has a prior sample.
+            self._on_apps(friend, (states.get(eid, {}).get("attributes") or {}).get("applications"), now)
         for eid, friend in list(self.on.items()) + list(self.np.items()):
             pic = states.get(eid, {}).get("attributes", {}).get("entity_picture")
             if pic and str(pic).startswith("http") and "gamerpic" not in self.status.get(friend, {}):
@@ -662,6 +717,68 @@ class Client:
                 self._set_status(self.gp[eid], "hasGamePass", _tri(new))
             elif eid in self.bal:
                 self._set_status(self.bal[eid], "msBalance", fmt_balance(new))
+            elif eid in self.appsens:
+                attrs = (d.get("new_state") or {}).get("attributes") or {}
+                self._on_apps(self.appsens[eid], attrs.get("applications"), ts)
+
+    # ---- ally (PC app usage via a Family Safety applications sensor) ----
+    def _on_apps(self, friend, applications, ts):
+        """Turn per-app cumulative daily counters into ally sessions.
+
+        The sensor reports, per app, minutes used so far TODAY. An app whose
+        counter moved since the previous sample was running during that interval;
+        one whose counter stood still was not. Only GAME_APPS entries are
+        considered, so a browser or launcher left open can never be credited.
+        """
+        prev = self._app_prev.setdefault(friend, {})
+        last = self._app_seen.get(friend)
+        self._app_seen[friend] = ts
+        cur = {}
+        for a in applications or []:
+            name = str(a.get("app_name") or "")
+            title = self.game_apps.get(name.lower())
+            if not title:
+                continue                      # not an allowlisted game: never credited
+            try:
+                mins = float(a.get("usage_minutes") or 0)
+            except (TypeError, ValueError):
+                continue
+            # Several processes can map to one title (a launcher plus its runtime);
+            # keep the largest so they resolve to a single session, not two.
+            cur[title] = max(cur.get(title, 0.0), mins)
+
+        active, reset = None, False
+        best = 0.0
+        for title, mins in cur.items():
+            was = prev.get(title)
+            prev[title] = mins
+            if was is None:
+                continue                      # first sight: baseline only, infer nothing
+            delta = mins - was
+            if delta < 0:
+                reset = True                  # midnight rollover: reseed, credit nothing
+            elif delta > 0 and delta > best:
+                best, active = delta, title
+
+        if last is None or reset:
+            return                            # no interval to attribute yet
+        if (ts - last) > APP_MAX_GAP:
+            # The device was off, or we were not listening. A delta here cannot be
+            # placed in time, so it is dropped rather than invented.
+            if active:
+                print(f"  [ally] {friend:<14} ignoring {best:.0f} min of {active} "
+                      f"reported after a {(ts - last).total_seconds() / 60:.0f} min gap",
+                      flush=True)
+            return
+
+        if active:
+            self.ally.set_online(friend, True, ts)
+            self.ally.set_in_game(friend, True, ts)
+            self.ally.set_now_playing(friend, active, ts, "ally")
+        else:
+            self.ally.set_now_playing(friend, None, ts, "ally")
+            self.ally.set_in_game(friend, False, ts)
+            self.ally.set_online(friend, False, ts)
 
     # ---- Steam ----
     async def _steam_loop(self):
@@ -710,9 +827,11 @@ class Client:
         today = datetime.now(self.tz).date().isoformat()
         now = datetime.now(timezone.utc)
         extra_online = ([(f, "xbox", s, e) for (f, s, e) in self.xbox.live_online(now)]
-                        + [(f, "steam", s, e) for (f, s, e) in self.steam.live_online(now)])
+                        + [(f, "steam", s, e) for (f, s, e) in self.steam.live_online(now)]
+                        + [(f, "ally", s, e) for (f, s, e) in self.ally.live_online(now)])
         extra_games = ([(f, "xbox", g, s, e, plat) for (f, g, s, e, plat) in self.xbox.live_games(now)]
-                       + [(f, "steam", g, s, e, None) for (f, g, s, e, plat) in self.steam.live_games(now)])
+                       + [(f, "steam", g, s, e, None) for (f, g, s, e, plat) in self.steam.live_games(now)]
+                       + [(f, "ally", g, s, e, plat) for (f, g, s, e, plat) in self.ally.live_games(now)])
         days = compute_daily(self.store, self.tz, set(self.steam_ids), extra_online, extra_games)
         for friend in self.status:                       # include status even with no play today
             days.setdefault(friend, {"friend": friend, "date": today, "minutes": 0, "games": []})
@@ -765,6 +884,27 @@ def print_summary(store, tz, steam_friends):
         print(f"\n{friend} — {tot/60:.1f}h {label} ({tot}m)")
         for g in sorted(d["games"], key=lambda x: -x["minutes"]):
             print(f"    {g['game']:<28} {g['minutes']/60:.1f}h  ({g['minutes']}m)")
+
+
+def _parse_game_apps(raw):
+    """GAME_APPS -> {lowercased app name: display title}.
+
+    Only apps listed here are ever credited from the ally source: a PC reports
+    browsers, launchers and OS utilities with the same kind of counter as games,
+    and crediting those would be presence, not play. "App=Display" lets several
+    processes (a launcher plus its runtime) collapse into ONE session instead of
+    two overlapping ones.
+    """
+    out = {}
+    for part in (raw or "").split(","):
+        part = part.strip()
+        if not part:
+            continue
+        name, _, disp = part.partition("=")
+        name = name.strip()
+        if name:
+            out[name.lower()] = (disp.strip() or name)
+    return out
 
 
 def _parse_steam_ids(raw):
@@ -911,6 +1051,64 @@ def selftest():
     e2.flush_all(T2(90))
     assert ("Grounded", 10, "Xbox One") in got2 and ("Halo", 8, "Windows") in got2, got2
 
+    # --- ally source: allowlist, collapse, reset, long-gap, bridge --------------
+    apps = _parse_game_apps("LauncherX=GameX, runtime=GameX , GameY ,UtilityApp")
+    assert apps == {"launcherx": "GameX", "runtime": "GameX",
+                    "gamey": "GameY", "utilityapp": "UtilityApp"}, apps
+
+    got3 = []
+    cl = Client.__new__(Client)                      # no socket needed for this path
+    cl.game_apps = {"launcherx": "GameX", "runtime": "GameX", "gamey": "GameY"}
+    cl._app_prev, cl._app_seen = {}, {}
+    cl.ally = Engine(lambda *_: None,
+                     lambda f, ga, st, en, mn, plat=None: got3.append((f, ga, round(mn))),
+                     use_last_online=False, game_gap=ALLY_GAME_GAP)
+    A = lambda mins: datetime(2026, 3, 1, tzinfo=timezone.utc) + timedelta(minutes=mins)
+    def sample(at, **mins):
+        cl._on_apps("P1", [{"app_name": k, "usage_minutes": v} for k, v in mins.items()], A(at))
+
+    # Non-allowlisted apps can never open a session, however fast they climb.
+    sample(0, UtilityApp=0); sample(5, UtilityApp=5); sample(10, UtilityApp=10)
+    cl.ally.flush_all(A(300))
+    assert got3 == [], f"non-allowlisted app credited: {got3}"
+
+    # A launcher and its runtime both climbing collapse into ONE title.
+    got3.clear(); cl._app_prev, cl._app_seen = {}, {}
+    sample(0, LauncherX=0, runtime=0)                         # baseline
+    for i in range(1, 7):                                     # 30 min of play
+        sample(i * 5, LauncherX=i * 5, runtime=i * 5)
+    sample(35, LauncherX=30, runtime=30)                      # frozen: stopped
+    cl.ally.flush_all(A(300))
+    assert len(got3) == 1 and got3[0][1] == "GameX", got3
+    assert got3[0][2] == 30, got3
+
+    # One frozen poll inside a session must bridge, not split (12-min window).
+    got3.clear(); cl._app_prev, cl._app_seen = {}, {}
+    sample(0, GameY=0)
+    sample(5, GameY=5); sample(10, GameY=10)
+    sample(15, GameY=10)                                      # reporting hiccup
+    sample(20, GameY=20); sample(25, GameY=25)
+    cl.ally.flush_all(A(300))
+    assert len(got3) == 1, f"frozen poll split the session: {got3}"
+
+    # Midnight rollover (counter drops) credits nothing.
+    got3.clear(); cl._app_prev, cl._app_seen = {}, {}
+    sample(0, GameY=100); sample(5, GameY=3)
+    cl.ally.flush_all(A(300))
+    assert got3 == [], f"counter reset credited time: {got3}"
+
+    # A delta reported after a long silence cannot be placed, so it is dropped.
+    got3.clear(); cl._app_prev, cl._app_seen = {}, {}
+    sample(0, GameY=0); sample(400, GameY=4)
+    cl.ally.flush_all(A(900))
+    assert got3 == [], f"post-gap delta invented a session: {got3}"
+
+    # Overlapping ally + steam: steam wins the minute, it is counted ONCE.
+    tot3, per3, psrc3, _ = resolve_precedence(
+        [(M(0), M(60), "GameX", _PRIO["ally"], "ally", "ally"),
+         (M(0), M(60), "GameX", _PRIO["steam"], "steam", None)])
+    assert round(tot3) == 60 and list(psrc3) == ["steam"], (tot3, psrc3)
+
     print("selftest OK \u2713")
 
 
@@ -928,8 +1126,10 @@ def main():
     if not (ha_url and ha_token) and not (steam_key and steam_ids):
         sys.exit("Set HA_URL+HA_TOKEN (Xbox) and/or STEAM_API_KEY+STEAM_IDS (Steam).")
     only = set(x.strip() for x in os.getenv("ONLY", "").split(",") if x.strip()) or None
+    game_apps = _parse_game_apps(os.getenv("GAME_APPS", ""))
     try:
-        asyncio.run(Client(ha_url, ha_token, store, tz, only, steam_key, steam_ids, kairos_url, ingest_token).run())
+        asyncio.run(Client(ha_url, ha_token, store, tz, only, steam_key, steam_ids,
+                           kairos_url, ingest_token, game_apps).run())
     except KeyboardInterrupt:
         print("\nstopped.")
 

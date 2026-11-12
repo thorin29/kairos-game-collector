@@ -63,6 +63,7 @@ no time is invented past the last real game signal.
 | Coalescer | Gap | Constant / env |
 |-----------|-----|----------------|
 | Xbox **game** reconnect | **8 min** | `XBOX_GAME_GAP` ← env `XBOX_GAME_GAP_MIN` (default 8) |
+| Ally **game** reconnect | **12 min** | `ALLY_GAME_GAP` ← env `ALLY_GAME_GAP_MIN` (default 12) — wider because two frozen polls span ~10 min |
 | Xbox **online** diagnostic | 5 min | `COALESCE_GAP` |
 | Steam game / online | 5 min | `COALESCE_GAP` |
 
@@ -150,6 +151,9 @@ forever. The local DB is only a buffer — Kairos keeps the durable history.
 | `RETAIN_DAYS` | no | `14` | prune sessions older than this |
 | `ONLY` | no | — | comma list of friend names to restrict to |
 | `XBOX_GAME_GAP_MIN` | no | `8` | Xbox same-game reconnect window, minutes |
+| `GAME_APPS` | for ally | — | allowlist for the PC "ally" source. `App` or `App=Display`, comma-separated. `App=Display` merges several processes (a launcher and its runtime) into one title. Empty disables the source. |
+| `ALLY_GAME_GAP_MIN` | no | `12` | ally same-game reconnect window, minutes |
+| `APP_MAX_GAP_MIN` | no | `15` | drop an app delta reported after a longer silence |
 
 Fixed timing constants (not env): online/Steam coalesce gap 5 min, flush loop
 20s, Steam poll 60s, push interval 300s.

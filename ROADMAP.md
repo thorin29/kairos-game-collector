@@ -1,38 +1,44 @@
 # Collector roadmap
 
-Open items, in priority order. The timing/coalescing logic is **frozen** until
-real observation data says otherwise — don't change it on theory.
+Status as of **29 Sep 2026**: the collector is **deployed and running**, and Xbox
+time credited to the kids comes from real game sessions rather than account
+presence. Item 1 below (deploy and observe) is closed — the numbers were compared
+against known play sessions and the engine held up.
 
-*Re-baselined 14 Oct 2026. No collector code has changed since 25 Sep.*
+The timing/coalescing logic stays **conservative**: change it only with evidence
+from a real observed session, not on theory.
 
-## 1. Observe against real play (deployed — the check is still to do)
+## 1. Deploy the frozen collector and observe — **done**
 
-The collector is deployed (GHCR image, auto-updated on Unraid) and running; the
-Xbox totals Kairos shows come from real game sessions. What hasn't been recorded
-here is a deliberate check: a few known play sessions compared against the
-collector's numbers, and a `device_tracker` / `media_player` state trace captured
-during one for later use. Do that before any further timing change.
+Deployed against real play; Xbox sessions resolve to sensible per-kid daily
+totals. The remaining inaccuracies are source-signal gaps (below), not timing
+logic. Capturing a `device_tracker` / `media_player` state trace during a real
+session is still worth doing before anything in item 3 is attempted.
 
-## 2. Two gaps that need a decision, not code
+## 2. Open gaps in what can be seen at all
 
-- **Minecraft Java Edition is untrackable as things stand.** It doesn't run
-  through Xbox presence and has no sensor in Home Assistant. The options are to
-  host the server ourselves and read its log / RCON for joins and leaves, to
-  lean on Family Safety PC time if it can be read per account, or to accept that
-  it isn't counted. Decision pending with the owner; don't build
-  either until it's made.
-- **PC play through the Xbox app on a shared family PC** doesn't surface
-  reliably in HA — the `now_playing` title drops or shows a non-game on Windows
-  (see DECISIONS, "PC/Windows presence is unreliable"), and a shared PC can't
-  attribute play to one child anyway. Probably no sensor-based fix; treat it as
-  a known gap unless a new signal appears.
+- **PC play — now covered where the PC is a managed Family Safety device.** Such
+  a PC exposes per-app daily counters, which the `ally` source credits (see
+  DECISIONS). What remains uncovered is a child playing on a **shared or
+  unmanaged** computer: Xbox reports presence with no title and Family Safety has
+  no device for them, so that time is still unmeasured — not zero. One observed
+  case remains unexplained (a console-only child online all day with no credited
+  game); check that child's `now_playing` timeline before assuming a cause.
+- **Minecraft Java — now partially tracked (closed).** The Family Safety
+  `applications` sensor reports the Java launcher and its runtime by name, so the
+  `ally` source credits it (both processes collapse to one title via `GAME_APPS`).
+  This is app-open time at ~5-minute resolution, not a confirmed session, so the
+  RCON/server-log option remains the only route to exact play times — but the gap
+  is no longer total and nothing needs to be built on spec.
+- **`--backfill` for past days.** A mode to recompute and re-push earlier days
+  whose totals were produced by the old presence-based logic. Offered, not built;
+  wanted only if a bogus historical day actually bothers someone.
 
 ## 3. Physical-console corroboration (future, evidence-gated)
 
 HA's Xbox integration can expose each physical console as a `media_player` (power
 state + focused app resolved to a title, ~10s refresh; requires "Remote features"
-enabled on the console). There are also Omada `device_tracker.xbox` /
-`device_tracker.xbox_2` entities (per-MAC on/off).
+enabled on the console). There are also per-MAC `device_tracker` entities.
 
 - **Value:** `media_title` = *what's running*; `device_tracker` off = a candidate
   *hard stop*; on ≠ playing.
@@ -40,15 +46,16 @@ enabled on the console). There are also Omada `device_tracker.xbox` /
   on a shared box (account presence does that); two consoles swapping /
   simultaneous play makes kid↔console mapping non-trivial. HA can delete/recreate
   the console `media_player` entity (a known HA bug), so **discover entities
-  dynamically — never hard-code IDs**. Downgrade `device_tracker: not_home` from
-  "hard stop" to "strong corroborating stop" until its real timing on this network
-  is observed (Omada can take minutes to notice a disconnect).
-- **Gate:** don't build until #1 gives real data.
+  dynamically — never hard-code IDs**. Treat `device_tracker: not_home` as a
+  strong corroborating stop, not a hard stop, until its real timing on this
+  network is observed (the switch can take minutes to notice a disconnect).
+- **Gate:** only worth building if a specific miscount traces back to a missing
+  stop signal.
 
 ## 4. Midnight-splitting
 
-A session that crosses midnight is currently credited entirely to the start day.
-Real bug, but only matters if kids regularly play across 12 AM. Left for later.
+A session that crosses midnight is credited entirely to the start day. A real
+bug, but it only matters if play regularly runs past 12 AM. Still open.
 
 ## Hygiene notes (not behavior changes)
 
@@ -56,3 +63,10 @@ Real bug, but only matters if kids regularly play across 12 AM. Left for later.
   (`_push_loop`, `_graceful_shutdown`) passes `5` explicitly, so the 20s default
   is never exercised. Harmless today; worth dropping the stale default to `5` next
   time the file is touched, so a future caller can't reintroduce a 20s stall.
+
+## Docs
+
+`README.md` describes the detection model and the environment; `DECISIONS.md`
+holds the reasoning and the rejected alternatives. Update both in the same change
+that alters behaviour — the web repo's `ROADMAP.md`/`DECISIONS.md` carry the
+Kairos-side view of game time.
