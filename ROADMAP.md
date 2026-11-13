@@ -62,8 +62,10 @@ bug, but it only matters if play regularly runs past 12 AM. Still open.
 
 - `Client._post` still declares a default `timeout: int = 20`, but every call site
   (`_push_loop`, `_graceful_shutdown`) passes `5` explicitly, so the 20s default
-  is never exercised. Harmless today; worth dropping the stale default to `5` next
-  time the file is touched, so a future caller can't reintroduce a 20s stall.
+  is never exercised. Harmless today. **Decided (13 Nov 2026):** change the
+  default to `5` in the next release that touches the collector for any other
+  reason, so a future caller can't reintroduce a 20s stall. Not worth a release
+  on its own.
 
 ## Docs
 
