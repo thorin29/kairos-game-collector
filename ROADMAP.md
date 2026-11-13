@@ -1,8 +1,9 @@
 # Collector roadmap
 
-Status as of **29 Sep 2026**: the collector is **deployed and running**, and Xbox
-time credited to the kids comes from real game sessions rather than account
-presence. Item 1 below (deploy and observe) is closed — the numbers were compared
+Status as of **13 Nov 2026** (collector 5.0.0): the collector is **deployed and
+running**. Xbox time credited to the kids comes from real game sessions rather
+than account presence, and the `ally` source credits allowlisted PC apps
+through Family Safety (see DECISIONS). Item 1 below (deploy and observe) is closed — the numbers were compared
 against known play sessions and the engine held up.
 
 The timing/coalescing logic stays **conservative**: change it only with evidence

@@ -5,8 +5,9 @@ alternative that was tried and rejected. Read this before changing the engine.
 **The timing/coalescing logic has now been observed against real play (Sept 2026)
 and held up — it is credited-session time, not presence.** It stays conservative:
 change it only with evidence from a real observed session, never on theory (see
-ROADMAP.md, which also lists what still can't be seen at all: PC play through the
-Xbox app on a shared computer, and Minecraft Java).
+ROADMAP.md, which also lists what still can't be seen: PC play through the Xbox
+app on a shared or unmanaged computer, and exact Minecraft Java sessions —
+Minecraft Java is only app-open time via `ally`, below).
 
 ---
 

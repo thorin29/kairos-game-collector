@@ -27,13 +27,23 @@ alternatives) behind everything below.
   gamerpic. Also reads the Microsoft Family Safety `*_balance` sensors.
 - **Steam** via the official Web API (`GetPlayerSummaries`, polled every 60s) for
   Steam-primary kids. No HA dependency for Steam — it has a clean API.
+- **Ally** (PC app usage) via a Microsoft Family Safety `applications` sensor in
+  Home Assistant, over the same socket. Only apps named in `GAME_APPS` are ever
+  credited; this is app-open time at about 5-minute resolution, so it has the
+  lowest precedence. Empty `GAME_APPS` turns it off. See DECISIONS.
 - Resolves each kid's **actual game-session time** for today and every ~5 min
   pushes the resolved totals + per-game breakdown + status + platform icons to
   Kairos (idempotent). Buffers everything in SQLite, pruned to `RETAIN_DAYS`.
 
-**Not tracked (open — see ROADMAP.md):** Minecraft Java Edition, which never
-appears in Xbox presence, and play through the Xbox app on a shared family PC,
-which Home Assistant doesn't surface reliably.
+**Partly tracked or not tracked (see ROADMAP.md):**
+
+- **Minecraft Java Edition** never appears in Xbox presence. On a PC managed by
+  Family Safety it is credited through `ally` when `GAME_APPS` lists the
+  launcher and its runtime. That is app-open time, not a confirmed session.
+  Exact play times would need the server's log or RCON.
+- **Play on a shared or unmanaged PC** (the Xbox app on a family computer) is
+  not tracked. Xbox reports presence with no title, Family Safety has no device
+  for that child, and Home Assistant doesn't surface it reliably.
 
 ---
 
