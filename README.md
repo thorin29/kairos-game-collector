@@ -40,7 +40,8 @@ alternatives) behind everything below.
 - **Minecraft Java Edition** never appears in Xbox presence. On a PC managed by
   Family Safety it is credited through `ally` when `GAME_APPS` lists the
   launcher and its runtime. That is app-open time, not a confirmed session.
-  Exact play times would need the server's log or RCON.
+  Exact play times would need a hosted server's log or RCON; no server is
+  planned, so this is final (see ROADMAP).
 - **Play on a shared or unmanaged PC** (the Xbox app on a family computer) is
   not tracked. Xbox reports presence with no title, Family Safety has no device
   for that child, and Home Assistant doesn't surface it reliably.

@@ -28,9 +28,9 @@ session is still worth doing before anything in item 3 is attempted.
 - **Minecraft Java — now partially tracked (closed).** The Family Safety
   `applications` sensor reports the Java launcher and its runtime by name, so the
   `ally` source credits it (both processes collapse to one title via `GAME_APPS`).
-  This is app-open time at ~5-minute resolution, not a confirmed session, so the
-  RCON/server-log option remains the only route to exact play times — but the gap
-  is no longer total and nothing needs to be built on spec.
+  This is app-open time at ~5-minute resolution, not a confirmed session.
+  **Decided 13 Nov 2026: no server will be hosted**, so RCON / server logs are
+  not pursued and this partial tracking is final.
 - **`--backfill` for past days.** A mode to recompute and re-push earlier days
   whose totals were produced by the old presence-based logic. Offered, not built;
   wanted only if a bogus historical day actually bothers someone.
