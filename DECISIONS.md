@@ -145,6 +145,17 @@ Minecraft Java is only app-open time via `ally`, below).
   `APP_MAX_GAP` (15 min) is dropped and logged, not credited: the device was off
   or nothing was listening, so the time cannot be placed. Same principle as the
   rejected forward grace.
+- **Ceiling check: ally time can never exceed device screen time.** Per-app
+  counters tick for any RUNNING process, so a background shell can out-accrue
+  actual use — one claimed 418 min against 152 min of device screen time. A child
+  cannot play longer than their device was on, so the collector compares the two
+  each push and logs a warning naming the biggest ally title. It is **diagnostic
+  only and alters nothing**: silently trimming the number would hide the cause,
+  and the cause is always a background app that belongs in `NOT_GAME_APPS`.
+- **Rejected: Microsoft's own screen-time report as a correctness check.** The
+  weekly Xbox summary is console-on time (dashboard, store, apps), not play, and
+  its own header disagreed with the sum of its daily bars by 38 min. It is an
+  upper bound, not ground truth.
 - **No PII in this repo.** The allowlist, friend names and entity ids all come
   from env and runtime discovery; nothing identifying is committed.
 

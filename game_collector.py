@@ -57,7 +57,7 @@ except Exception:
     websockets = None
 
 UNSET = {"", "none", "unknown", "unavailable"}
-COLLECTOR_VERSION = "5.1.1"
+COLLECTOR_VERSION = "5.2.0"
 COALESCE_GAP = timedelta(minutes=5)
 # How long a game session stays reconnectable after the game signal drops. If the
 # SAME game is confirmed again within this window, the two pieces are joined and
@@ -472,6 +472,9 @@ class Client:
         self.np: dict[str, str] = {}; self.lo: dict[str, str] = {}
         self.gs: dict[str, str] = {}; self.gp: dict[str, str] = {}; self.bal: dict[str, str] = {}
         self.appsens: dict[str, str] = {}          # Family Safety applications sensor -> friend
+        self.scrsens: dict[str, str] = {}          # Family Safety screen-time sensor -> friend
+        self.scr_minutes: dict[str, float] = {}    # friend -> device screen minutes today
+        self._ally_warned: dict[str, str] = {}     # friend -> date already warned for
         self.game_apps = game_apps or {}           # lowercased app name -> display title
         self.not_games = not_games or set()        # lowercased app names never credited
         self._app_reported: set[str] = set()       # apps already reported for review
@@ -668,14 +671,23 @@ class Client:
                         self.bal[eid] = friend
                         break
         # Family Safety "applications" sensors (different integration) by first name.
-        self.appsens.clear()
+        self.appsens.clear(); self.scrsens.clear()
         for e in ents:
             eid = e["entity_id"]
-            if eid.endswith("_applications") and "family_safety" in eid:
-                for friend in friends:
-                    if friend.split()[0].lower() in eid:
-                        self.appsens[eid] = friend
-                        break
+            if "family_safety" not in eid:
+                continue
+            if eid.endswith("_applications"):
+                target = self.appsens
+            elif eid.endswith("_screen_time"):
+                # The child's own screen-time figure (device time). Used only as a
+                # ceiling check on the ally source — never as credited time.
+                target = self.scrsens
+            else:
+                continue
+            for friend in friends:
+                if friend.split()[0].lower() in eid:
+                    target[eid] = friend
+                    break
         print(f"[+] tracking {len(friends)} Xbox friend(s): {friends}", flush=True)
         if self.bal:
             print(f"[+] Family Safety balance for: {sorted(set(self.bal.values()))}", flush=True)
@@ -707,6 +719,11 @@ class Client:
             self._set_status(friend, "hasGamePass", _tri(states.get(eid, {}).get("state")))
         for eid, friend in self.bal.items():
             self._set_status(friend, "msBalance", fmt_balance(states.get(eid, {}).get("state")))
+        for eid, friend in self.scrsens.items():
+            try:
+                self.scr_minutes[friend] = float(states.get(eid, {}).get("state"))
+            except (TypeError, ValueError):
+                pass
         for eid, friend in self.appsens.items():
             # Baseline only: _on_apps infers nothing until it has a prior sample.
             self._on_apps(friend, (states.get(eid, {}).get("attributes") or {}).get("applications"), now)
@@ -740,9 +757,45 @@ class Client:
                 self._set_status(self.gp[eid], "hasGamePass", _tri(new))
             elif eid in self.bal:
                 self._set_status(self.bal[eid], "msBalance", fmt_balance(new))
+            elif eid in self.scrsens:
+                try:
+                    self.scr_minutes[self.scrsens[eid]] = float(new)
+                except (TypeError, ValueError):
+                    pass
             elif eid in self.appsens:
                 attrs = (d.get("new_state") or {}).get("attributes") or {}
                 self._on_apps(self.appsens[eid], attrs.get("applications"), ts)
+
+    def _check_ally_ceiling(self, days, now):
+        """Warn when credited ally time exceeds the child's own device screen time.
+
+        Ally minutes come from per-app counters, which tick for any RUNNING
+        process — a background shell or launcher can therefore out-accrue the
+        time the device was actually in use (one shell once claimed 418 min
+        against 152 min of screen time). A child cannot play longer than their
+        device was on, so ally > device means something is being credited that
+        is not play: almost always a background app that belongs in
+        NOT_GAME_APPS. Diagnostic only — nothing is altered, because silently
+        trimming a number would hide the cause.
+        """
+        today = now.astimezone(self.tz).date().isoformat()
+        for friend, d in days.items():
+            device = self.scr_minutes.get(friend)
+            if not device or device <= 0:
+                continue                      # no device figure: nothing to check
+            ally = sum(g.get("minutes", 0) for g in d.get("games", [])
+                       if g.get("platform") == "ally")
+            if ally <= device:
+                continue
+            if self._ally_warned.get(friend) == today:
+                continue                      # once a day is enough
+            self._ally_warned[friend] = today
+            worst = max((g for g in d.get("games", []) if g.get("platform") == "ally"),
+                        key=lambda g: g.get("minutes", 0), default=None)
+            hint = f' — biggest: "{worst.get("game")}" {worst.get("minutes")}m' if worst else ""
+            print(f"  [!] {friend}: ally credited {ally:.0f}m but the device was only "
+                  f"used {device:.0f}m today. A background app is probably being "
+                  f"counted; add it to NOT_GAME_APPS{hint}", flush=True)
 
     # ---- ally (PC app usage via a Family Safety applications sensor) ----
     def _is_not_game(self, key):
@@ -877,6 +930,7 @@ class Client:
                        + [(f, "steam", g, s, e, None) for (f, g, s, e, plat) in self.steam.live_games(now)]
                        + [(f, "ally", g, s, e, plat) for (f, g, s, e, plat) in self.ally.live_games(now)])
         days = compute_daily(self.store, self.tz, set(self.steam_ids), extra_online, extra_games)
+        self._check_ally_ceiling(days, now)
         for friend in self.status:                       # include status even with no play today
             days.setdefault(friend, {"friend": friend, "date": today, "minutes": 0, "games": []})
         # Platform icons = the sources that actually earned credited game time today
@@ -1225,6 +1279,32 @@ def selftest():
         [(M(0), M(60), "GameX", _PRIO["ally"], "ally", "ally"),
          (M(0), M(60), "GameX", _PRIO["steam"], "steam", None)])
     assert round(tot3) == 60 and list(psrc3) == ["steam"], (tot3, psrc3)
+
+    # --- ally ceiling check: credited ally time cannot exceed device use -------
+    cl2 = Client.__new__(Client)
+    cl2.tz = timezone.utc
+    cl2.scr_minutes = {"P1": 152.0, "P2": 0.0}
+    cl2._ally_warned = {}
+    day = {
+        "P1": {"games": [{"game": "ShellApp", "minutes": 418, "platform": "ally"},
+                         {"game": "RealGame", "minutes": 20, "platform": "ally"}]},
+        "P2": {"games": [{"game": "RealGame", "minutes": 500, "platform": "ally"}]},
+    }
+    cl2._check_ally_ceiling(day, datetime(2026, 3, 1, tzinfo=timezone.utc))
+    assert cl2._ally_warned.get("P1") == "2026-03-01", "ceiling breach not flagged"
+    assert "P2" not in cl2._ally_warned, "warned without a device figure"
+    cl2._check_ally_ceiling(day, datetime(2026, 3, 1, 12, tzinfo=timezone.utc))  # same day
+    # under the ceiling: silent
+    cl2._ally_warned.clear()
+    cl2._check_ally_ceiling({"P1": {"games": [{"game": "RealGame", "minutes": 90,
+                                               "platform": "ally"}]}},
+                            datetime(2026, 3, 1, tzinfo=timezone.utc))
+    assert cl2._ally_warned == {}, "warned while under the ceiling"
+    # xbox/steam time is never measured against the PC ceiling
+    cl2._check_ally_ceiling({"P1": {"games": [{"game": "Console", "minutes": 400,
+                                               "platform": "Scarlett"}]}},
+                            datetime(2026, 3, 1, tzinfo=timezone.utc))
+    assert cl2._ally_warned == {}, "console time measured against the PC ceiling"
 
     print("selftest OK \u2713")
 

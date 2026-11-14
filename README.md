@@ -165,6 +165,12 @@ forever. The local DB is only a buffer — Kairos keeps the durable history.
 | `NOT_GAME_APPS` | no | built-in set | extends the built-in non-game denylist for the "ally" PC source (browsers, launchers, OS/vendor utilities). Everything not denied is credited as a game. |
 | `GAME_APPS` | no | — | display-name map for the ally source, `App=Display`. Shows a runtime process under the game's name and merges several processes into one session. Does not gate crediting. |
 | `ALLY_MIN_NEW_APP_MIN` | no | `5` | minutes a newly seen app must reach before it is reported for review |
+
+The collector also compares each child's credited **ally** time against their own
+Family Safety screen-time figure on every push. Ally time exceeding device time
+means a background app is being counted as a game; a warning naming the biggest
+offender is logged once a day. Nothing is altered — add the app to
+`NOT_GAME_APPS`.
 | `ALLY_GAME_GAP_MIN` | no | `12` | ally same-game reconnect window, minutes |
 | `APP_MAX_GAP_MIN` | no | `15` | drop an app delta reported after a longer silence |
 
