@@ -162,7 +162,9 @@ forever. The local DB is only a buffer — Kairos keeps the durable history.
 | `RETAIN_DAYS` | no | `14` | prune sessions older than this |
 | `ONLY` | no | — | comma list of friend names to restrict to |
 | `XBOX_GAME_GAP_MIN` | no | `8` | Xbox same-game reconnect window, minutes |
-| `GAME_APPS` | for ally | — | allowlist for the PC "ally" source. `App` or `App=Display`, comma-separated. `App=Display` merges several processes (a launcher and its runtime) into one title. Empty disables the source. |
+| `NOT_GAME_APPS` | no | built-in set | extends the built-in non-game denylist for the "ally" PC source (browsers, launchers, OS/vendor utilities). Everything not denied is credited as a game. |
+| `GAME_APPS` | no | — | display-name map for the ally source, `App=Display`. Shows a runtime process under the game's name and merges several processes into one session. Does not gate crediting. |
+| `ALLY_MIN_NEW_APP_MIN` | no | `5` | minutes a newly seen app must reach before it is reported for review |
 | `ALLY_GAME_GAP_MIN` | no | `12` | ally same-game reconnect window, minutes |
 | `APP_MAX_GAP_MIN` | no | `15` | drop an app delta reported after a longer silence |
 

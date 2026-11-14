@@ -24,11 +24,18 @@ Env:
   STEAM_API_KEY, STEAM_IDS             Steam (e.g. STEAM_IDS="Name=765...")
   KAIROS_URL                           e.g. https://kairos.example.com
   GAMETIME_INGEST_TOKEN                shared secret (same value set on Kairos)
-  GAME_APPS                            allowlist for the "ally" PC source. Comma
-                                       separated; "App" or "App=Display" to merge
-                                       several processes into one title, e.g.
-                                       GAME_APPS="LauncherX=GameX,runtime=GameX,GameY"
-                                       Empty (default) disables the ally source.
+  NOT_GAME_APPS                        denylist for the "ally" PC source: browsers,
+                                       launchers, OS/vendor utilities. Everything
+                                       NOT listed is treated as a game. Comma
+                                       separated; a built-in default covers the
+                                       usual Windows/vendor set and is EXTENDED
+                                       (not replaced) by this value.
+  GAME_APPS                            optional DISPLAY-NAME map for the ally
+                                       source, e.g. "runtime=GameX" to show a
+                                       runtime process under the game's name. It
+                                       no longer gates what is credited.
+  ALLY_MIN_NEW_APP_MIN (5)             a newly seen app must reach this many
+                                       minutes before it is reported for review.
   ALLY_GAME_GAP_MIN (12)               ally reconnect bridge; wider than Xbox's 8
                                        because two frozen polls span ~10 min.
   APP_MAX_GAP_MIN (15)                 ignore an app delta reported after a longer
@@ -50,7 +57,7 @@ except Exception:
     websockets = None
 
 UNSET = {"", "none", "unknown", "unavailable"}
-COLLECTOR_VERSION = "5.0.0"
+COLLECTOR_VERSION = "5.1.0"
 COALESCE_GAP = timedelta(minutes=5)
 # How long a game session stays reconnectable after the game signal drops. If the
 # SAME game is confirmed again within this window, the two pieces are joined and
@@ -68,6 +75,8 @@ ALLY_GAME_GAP = timedelta(minutes=int(os.environ.get("ALLY_GAME_GAP_MIN", "12"))
 # A delta reported after a longer silence cannot be placed in time (the device was
 # off, or the collector/HA was down), so it is dropped rather than invented.
 APP_MAX_GAP = timedelta(minutes=int(os.environ.get("APP_MAX_GAP_MIN", "15")))
+# A newly seen app must reach this before it is worth reporting for review.
+ALLY_MIN_NEW_APP = float(os.environ.get("ALLY_MIN_NEW_APP_MIN", "5"))
 FLUSH_INTERVAL = 20
 STEAM_POLL = 60
 PUSH_INTERVAL = 300   # push rollups+status to Kairos every 5 min
@@ -300,7 +309,9 @@ class Store:
                  start_utc TEXT, end_utc TEXT, minutes REAL);
                CREATE TABLE IF NOT EXISTS game_sessions(
                  id INTEGER PRIMARY KEY AUTOINCREMENT, friend TEXT, source TEXT DEFAULT 'xbox',
-                 game TEXT, start_utc TEXT, end_utc TEXT, minutes REAL);"""
+                 game TEXT, start_utc TEXT, end_utc TEXT, minutes REAL);
+               CREATE TABLE IF NOT EXISTS app_review(
+                 app TEXT PRIMARY KEY, friend TEXT, first_seen_utc TEXT, minutes REAL);"""
         )
         for t in ("online_sessions", "game_sessions"):
             try:
@@ -322,6 +333,18 @@ class Store:
     def add_game(self, friend, source, game, s, e, m, platform=None):
         self.db.execute("INSERT INTO game_sessions(friend,source,game,start_utc,end_utc,minutes,platform) VALUES(?,?,?,?,?,?,?)",
                         (friend, source, game, s.isoformat(), e.isoformat(), m, platform)); self.db.commit()
+
+    def note_app(self, app, friend, minutes, now):
+        """Record an app credited as a game that was never explicitly classified,
+        so `--summary` can surface it for review instead of it hiding in a total."""
+        self.db.execute(
+            "INSERT INTO app_review(app,friend,first_seen_utc,minutes) VALUES(?,?,?,?) "
+            "ON CONFLICT(app) DO UPDATE SET minutes=max(minutes,excluded.minutes)",
+            (app, friend, now.isoformat(), minutes)); self.db.commit()
+
+    def app_review_rows(self):
+        return self.db.execute(
+            "SELECT app,friend,first_seen_utc,minutes FROM app_review ORDER BY minutes DESC").fetchall()
 
     def online_rows(self):
         return self.db.execute("SELECT friend,source,start_utc,end_utc,minutes FROM online_sessions").fetchall()
@@ -437,7 +460,7 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
 # ---------------------------------------------------------------- client
 class Client:
     def __init__(self, ha_url, ha_token, store, tz, only, steam_key, steam_ids, kairos_url,
-                 ingest_token, game_apps=None):
+                 ingest_token, game_apps=None, not_games=None):
         self.ws_url = (ha_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
                        + "/api/websocket") if ha_url else None
         self.ha_token, self.store, self.tz, self.only = ha_token, store, tz, only
@@ -450,6 +473,9 @@ class Client:
         self.gs: dict[str, str] = {}; self.gp: dict[str, str] = {}; self.bal: dict[str, str] = {}
         self.appsens: dict[str, str] = {}          # Family Safety applications sensor -> friend
         self.game_apps = game_apps or {}           # lowercased app name -> display title
+        self.not_games = not_games or set()        # lowercased app names never credited
+        self._app_reported: set[str] = set()       # apps already reported for review
+        self._app_new: dict[str, float] = {}       # app -> minutes today (review queue)
         self._app_prev: dict[str, dict[str, float]] = {}   # friend -> app -> last minutes
         self._app_seen: dict[str, datetime] = {}           # friend -> last applications event
         self.status: dict[str, dict] = {}
@@ -642,23 +668,20 @@ class Client:
                         self.bal[eid] = friend
                         break
         # Family Safety "applications" sensors (different integration) by first name.
-        # Only wired up when GAME_APPS is set: without an allowlist there is nothing
-        # the ally source is allowed to credit.
         self.appsens.clear()
-        if self.game_apps:
-            for e in ents:
-                eid = e["entity_id"]
-                if eid.endswith("_applications") and "family_safety" in eid:
-                    for friend in friends:
-                        if friend.split()[0].lower() in eid:
-                            self.appsens[eid] = friend
-                            break
+        for e in ents:
+            eid = e["entity_id"]
+            if eid.endswith("_applications") and "family_safety" in eid:
+                for friend in friends:
+                    if friend.split()[0].lower() in eid:
+                        self.appsens[eid] = friend
+                        break
         print(f"[+] tracking {len(friends)} Xbox friend(s): {friends}", flush=True)
         if self.bal:
             print(f"[+] Family Safety balance for: {sorted(set(self.bal.values()))}", flush=True)
         if self.appsens:
             print(f"[+] ally PC app usage for: {sorted(set(self.appsens.values()))} "
-                  f"({len(self.game_apps)} allowlisted app(s))", flush=True)
+                  f"({len(self.not_games)} app(s) denylisted as non-games)", flush=True)
 
     async def _snapshot(self, ws):
         states = {s["entity_id"]: s for s in await self._cmd(ws, {"type": "get_states"})}
@@ -722,13 +745,21 @@ class Client:
                 self._on_apps(self.appsens[eid], attrs.get("applications"), ts)
 
     # ---- ally (PC app usage via a Family Safety applications sensor) ----
+    def _is_not_game(self, key):
+        """Denylist match: exact, or a prefix so versioned names still match
+        (e.g. a utility that appends a version to its display name)."""
+        if key in self.not_games:
+            return True
+        return any(key.startswith(n) for n in self.not_games if len(n) >= 6)
+
     def _on_apps(self, friend, applications, ts):
         """Turn per-app cumulative daily counters into ally sessions.
 
         The sensor reports, per app, minutes used so far TODAY. An app whose
         counter moved since the previous sample was running during that interval;
-        one whose counter stood still was not. Only GAME_APPS entries are
-        considered, so a browser or launcher left open can never be credited.
+        one whose counter stood still was not. Everything except NOT_GAME_APPS is
+        treated as a game, so a newly installed title is caught without config;
+        anything newly seen is reported once so a mislabel can be denied.
         """
         prev = self._app_prev.setdefault(friend, {})
         last = self._app_seen.get(friend)
@@ -736,16 +767,29 @@ class Client:
         cur = {}
         for a in applications or []:
             name = str(a.get("app_name") or "")
-            title = self.game_apps.get(name.lower())
-            if not title:
-                continue                      # not an allowlisted game: never credited
+            key = name.lower()
+            if not key or self._is_not_game(key):
+                continue                      # browser / launcher / utility: never play
             try:
                 mins = float(a.get("usage_minutes") or 0)
             except (TypeError, ValueError):
                 continue
-            # Several processes can map to one title (a launcher plus its runtime);
-            # keep the largest so they resolve to a single session, not two.
+            # Display-name map only: lets a runtime process show under the game's
+            # name, and lets several processes resolve to ONE session, not two.
+            title = self.game_apps.get(key, name)
             cur[title] = max(cur.get(title, 0.0), mins)
+            # Review queue: anything not explicitly denied is credited as a game,
+            # so say so once rather than letting a mislabel hide in the numbers.
+            if key not in self.game_apps and mins >= ALLY_MIN_NEW_APP:
+                self._app_new[name] = mins
+                if key not in self._app_reported:
+                    self._app_reported.add(key)
+                    try:
+                        self.store.note_app(name, friend, mins, ts)
+                    except Exception as e:
+                        print(f"  [ally] could not record app for review: {e}", flush=True)
+                    print(f'  [ally] new app: "{name}" {mins:.0f} min today — counted as '
+                          f'a game; add to NOT_GAME_APPS if it is not one', flush=True)
 
         active, reset = None, False
         best = 0.0
@@ -880,20 +924,67 @@ def print_summary(store, tz, steam_friends):
     print(f"\n=== Game time for {today} ===")
     for friend in sorted(days):
         d = days[friend]; tot = d["minutes"]
-        label = "gaming  [Steam-primary]" if friend in steam_friends else "on Xbox"
-        print(f"\n{friend} — {tot/60:.1f}h {label} ({tot}m)")
+        # Name the sources that actually earned credited time rather than
+        # assuming Xbox — ally and Steam can carry most or all of a day.
+        srcs = ", ".join(d.get("sources") or []) or "no source"
+        primary = "  [Steam-primary]" if friend in steam_friends else ""
+        print(f"\n{friend} — {tot/60:.1f}h on {srcs}{primary} ({tot}m)")
         for g in sorted(d["games"], key=lambda x: -x["minutes"]):
             print(f"    {g['game']:<28} {g['minutes']/60:.1f}h  ({g['minutes']}m)")
+
+    rows = store.app_review_rows()
+    if rows:
+        print("\n--- ally apps credited as games but never classified ---")
+        print("    Add any that are NOT games to NOT_GAME_APPS, then restart.")
+        for app, friend, first, mins in rows:
+            print(f"    {app:<34} {mins:>6.0f}m  (first seen {first[:10]})")
+
+
+# Apps that are never play, shipped as a default so a fresh deployment is not
+# wrong on day one. Generic Windows/vendor/browser/launcher names only — nothing
+# here identifies a household or its library. NOT_GAME_APPS extends this set.
+#
+# Why a denylist and not an allowlist: the set of GAMES changes (a new title
+# appears and an allowlist silently misses it, which is invisible), while the set
+# of utilities is stable. Over-counting a new utility announces itself in the
+# numbers and gets denied; under-counting a new game hides. Prefer the visible
+# failure. Launchers live here too when the game reports separately or a runtime
+# is the honest signal — a launcher left open accrues like a browser.
+_DEFAULT_NOT_GAMES = """
+amd radeon software, armoury crate, armoury crate se, asus command center,
+asus glidex, asusupdater module, myasus, canon print assistant, click to do,
+copilot, dolby access, dolby digital plus decoder for pc oems, gamingservicesui.exe,
+microsoft clipchamp, microsoft edge, microsoft family, microsoft news,
+microsoft photos, microsoft sticky notes, microsoft store,
+microsoft store package dependency installer, microsoft teams, microsoft to do,
+microsoft whiteboard, microsoft visual c++, mixed reality link, msn weather,
+onedrive, outlook for windows, paint, phone link, power automate, powerpoint,
+quick assist, shellhost, solitaire & casual games, windows calculator,
+windows clock, windows feature experience pack, windows media player,
+windows notepad, windows security, windows sound recorder, windows terminal,
+word, excel, google chrome, firefox, brave, bravesoftware update,
+braveupdate.exe, prism launcher, prism launcher installer, steam,
+steam client webhelper, xbox, the curseforge electron app, curseforge,
+ea app, discord, spotify, zoom, slack, vlc, notepad++, 7-zip
+"""
+
+
+def _split_list(raw):
+    return [p.strip().lower() for p in (raw or "").replace("\n", ",").split(",") if p.strip()]
+
+
+def _parse_not_games(raw):
+    """Built-in non-game set, extended by NOT_GAME_APPS."""
+    return set(_split_list(_DEFAULT_NOT_GAMES)) | set(_split_list(raw))
 
 
 def _parse_game_apps(raw):
     """GAME_APPS -> {lowercased app name: display title}.
 
-    Only apps listed here are ever credited from the ally source: a PC reports
-    browsers, launchers and OS utilities with the same kind of counter as games,
-    and crediting those would be presence, not play. "App=Display" lets several
-    processes (a launcher plus its runtime) collapse into ONE session instead of
-    two overlapping ones.
+    Display-name mapping only. It does NOT decide what is credited (the denylist
+    does that): its job is to show a runtime process under the game's own name,
+    and to let several processes resolve to ONE session instead of overlapping
+    ones.
     """
     out = {}
     for part in (raw or "").split(","):
@@ -1052,13 +1143,17 @@ def selftest():
     assert ("Grounded", 10, "Xbox One") in got2 and ("Halo", 8, "Windows") in got2, got2
 
     # --- ally source: allowlist, collapse, reset, long-gap, bridge --------------
-    apps = _parse_game_apps("LauncherX=GameX, runtime=GameX , GameY ,UtilityApp")
-    assert apps == {"launcherx": "GameX", "runtime": "GameX",
-                    "gamey": "GameY", "utilityapp": "UtilityApp"}, apps
+    apps = _parse_game_apps("runtime=GameX , GameY")
+    assert apps == {"runtime": "GameX", "gamey": "GameY"}, apps
+    ng = _parse_not_games("UtilityApp, LauncherX")
+    assert "utilityapp" in ng and "launcherx" in ng, "NOT_GAME_APPS not merged"
+    assert "google chrome" in ng and "prism launcher" in ng, "built-in denylist missing"
 
     got3 = []
     cl = Client.__new__(Client)                      # no socket needed for this path
-    cl.game_apps = {"launcherx": "GameX", "runtime": "GameX", "gamey": "GameY"}
+    cl.game_apps = {"runtime": "GameX"}
+    cl.not_games = {"utilityapp", "launcherx"}
+    cl._app_reported, cl._app_new = set(), {}
     cl._app_prev, cl._app_seen = {}, {}
     cl.ally = Engine(lambda *_: None,
                      lambda f, ga, st, en, mn, plat=None: got3.append((f, ga, round(mn))),
@@ -1067,20 +1162,33 @@ def selftest():
     def sample(at, **mins):
         cl._on_apps("P1", [{"app_name": k, "usage_minutes": v} for k, v in mins.items()], A(at))
 
-    # Non-allowlisted apps can never open a session, however fast they climb.
+    # Denylisted apps can never open a session, however fast they climb.
     sample(0, UtilityApp=0); sample(5, UtilityApp=5); sample(10, UtilityApp=10)
     cl.ally.flush_all(A(300))
-    assert got3 == [], f"non-allowlisted app credited: {got3}"
+    assert got3 == [], f"denylisted app credited: {got3}"
 
-    # A launcher and its runtime both climbing collapse into ONE title.
+    # A denylisted LAUNCHER is ignored while its runtime drives the session, and
+    # the runtime is shown under the game's display name.
     got3.clear(); cl._app_prev, cl._app_seen = {}, {}
     sample(0, LauncherX=0, runtime=0)                         # baseline
     for i in range(1, 7):                                     # 30 min of play
-        sample(i * 5, LauncherX=i * 5, runtime=i * 5)
-    sample(35, LauncherX=30, runtime=30)                      # frozen: stopped
+        sample(i * 5, LauncherX=i * 50, runtime=i * 5)        # launcher idles fast
+    sample(35, LauncherX=300, runtime=30)                     # runtime frozen: stopped
     cl.ally.flush_all(A(300))
     assert len(got3) == 1 and got3[0][1] == "GameX", got3
-    assert got3[0][2] == 30, got3
+    assert got3[0][2] == 30, f"launcher idle time leaked in: {got3}"
+
+    # An UNKNOWN app (neither denied nor mapped) is credited as a game and
+    # reported once for review — the whole point of the inversion.
+    got3.clear(); cl._app_prev, cl._app_seen = {}, {}
+    cl._app_reported, cl._app_new = set(), {}
+    sample(0, **{"Brand New Game": 0})
+    for i in range(1, 5):
+        sample(i * 5, **{"Brand New Game": i * 5})
+    sample(25, **{"Brand New Game": 20})
+    cl.ally.flush_all(A(300))
+    assert len(got3) == 1 and got3[0][1] == "Brand New Game", got3
+    assert "brand new game" in cl._app_reported, cl._app_reported
 
     # One frozen poll inside a session must bridge, not split (12-min window).
     got3.clear(); cl._app_prev, cl._app_seen = {}, {}
@@ -1127,9 +1235,10 @@ def main():
         sys.exit("Set HA_URL+HA_TOKEN (Xbox) and/or STEAM_API_KEY+STEAM_IDS (Steam).")
     only = set(x.strip() for x in os.getenv("ONLY", "").split(",") if x.strip()) or None
     game_apps = _parse_game_apps(os.getenv("GAME_APPS", ""))
+    not_games = _parse_not_games(os.getenv("NOT_GAME_APPS", ""))
     try:
         asyncio.run(Client(ha_url, ha_token, store, tz, only, steam_key, steam_ids,
-                           kairos_url, ingest_token, game_apps).run())
+                           kairos_url, ingest_token, game_apps, not_games).run())
     except KeyboardInterrupt:
         print("\nstopped.")
 

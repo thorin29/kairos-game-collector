@@ -105,11 +105,24 @@ Minecraft Java is only app-open time via `ally`, below).
   Safety `applications` sensor over the existing HA socket (no new dependency, no
   new credentials). An app whose counter moved between samples was running; one
   whose counter stood still was not.
-- **Allowlist only.** `GAME_APPS` names the apps that may ever be credited. A PC
-  reports browsers, launchers and OS utilities with the same kind of counter as a
-  game — one browser accrued 688 minutes in a day purely by being open. Crediting
-  those would be presence by another name. `App=Display` collapses a launcher and
-  its runtime into ONE title so they resolve to a single session.
+- **Denylist, not allowlist** (revised v5.1.0). `NOT_GAME_APPS` — a built-in
+  default set, extendable by env — names what is never play; everything else is
+  credited as a game. The first cut used an allowlist and was wrong: the set of
+  GAMES changes (a newly installed title is silently missed, and a missing title
+  is invisible), while the set of utilities is stable. Over-counting a new
+  utility announces itself in the numbers and gets denied; under-counting a new
+  game hides. Prefer the visible failure.
+- **Every newly seen app is reported once** — to the log and to an `app_review`
+  table surfaced by `--summary` — so a mislabel is reviewed rather than buried.
+- **`GAME_APPS` is now display-naming only.** It no longer gates crediting; it
+  maps a runtime process onto the game's own name and lets several processes
+  resolve to ONE session.
+- **Launchers are denied; runtimes are the signal.** Observed: a Minecraft
+  launcher accrued 335 min in a day while its JVM — which only runs while the
+  game runs — accrued 32. The launcher was left open. Where a game reports under
+  its own name (Xbox app, Steam), the launcher is denied outright; where only a
+  runtime marks real play, the runtime is credited and the launcher denied. A
+  browser accruing 688 min in a day is the same failure in its purest form.
 - **Credited, with its quality stated.** Ally minutes DO count toward the daily
   total — otherwise the blank days stay blank and nothing is fixed. But they are
   *app-open* time at ~5-minute resolution, a weaker signal than a confirmed Xbox
