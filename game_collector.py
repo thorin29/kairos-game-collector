@@ -24,6 +24,14 @@ Env:
   STEAM_API_KEY, STEAM_IDS             Steam (e.g. STEAM_IDS="Name=765...")
   KAIROS_URL                           e.g. https://kairos.example.com
   GAMETIME_INGEST_TOKEN                shared secret (same value set on Kairos)
+  GAMEPASS_HOSTS                       accounts that sign in on another child's
+                                       console to share Game Pass. When such an
+                                       account's Xbox session is an exact
+                                       duplicate of another child's (same title,
+                                       same start and end), it is the passenger
+                                       and is not credited. Comma separated.
+  SHARED_TOL_SEC (60)                  how close two sessions must be to count as
+                                       the same console session.
   NOT_GAME_APPS                        denylist for the "ally" PC source: browsers,
                                        launchers, OS/vendor utilities. Everything
                                        NOT listed is treated as a game. Comma
@@ -57,7 +65,7 @@ except Exception:
     websockets = None
 
 UNSET = {"", "none", "unknown", "unavailable"}
-COLLECTOR_VERSION = "5.2.0"
+COLLECTOR_VERSION = "5.3.0"
 COALESCE_GAP = timedelta(minutes=5)
 # How long a game session stays reconnectable after the game signal drops. If the
 # SAME game is confirmed again within this window, the two pieces are joined and
@@ -77,6 +85,10 @@ ALLY_GAME_GAP = timedelta(minutes=int(os.environ.get("ALLY_GAME_GAP_MIN", "12"))
 APP_MAX_GAP = timedelta(minutes=int(os.environ.get("APP_MAX_GAP_MIN", "15")))
 # A newly seen app must reach this before it is worth reporting for review.
 ALLY_MIN_NEW_APP = float(os.environ.get("ALLY_MIN_NEW_APP_MIN", "5"))
+# Two accounts signed in on ONE console report identical presence transitions, so
+# their sessions match to the second. Two children genuinely playing the same game
+# on two different consoles start and stop independently and will not.
+SHARED_TOL = float(os.environ.get("SHARED_TOL_SEC", "60"))
 FLUSH_INTERVAL = 20
 STEAM_POLL = 60
 PUSH_INTERVAL = 300   # push rollups+status to Kairos every 5 min
@@ -399,7 +411,57 @@ def resolve_precedence(intervals):
     return total, per_game, per_source, per_game_plat
 
 
-def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None):
+_shared_logged: set = set()
+
+
+def _drop_shared_console_duplicates(games, share_hosts, tz):
+    """Remove the passenger's copy of a session played on someone else's console.
+
+    Game Pass sharing requires the owning account to be signed in on the console
+    the other child plays on. Xbox then reports BOTH accounts as in that title,
+    so the collector sees two identical sessions and credits the time twice. HA
+    exposes no `is_primary`, `title_id` or console identity to tell them apart.
+
+    What it can tell is that the two sessions are the same console session: same
+    title, same source, and start AND end matching within `SHARED_TOL`. Two
+    children on two consoles stop and start independently, so their boundaries
+    do not coincide to the second.
+
+    The passenger is named by GAMEPASS_HOSTS. Without that config nothing is
+    dropped: guessing which child really played would be inventing data, so the
+    duplicate is logged and both are left credited.
+    """
+    if not share_hosts:
+        return games
+    sig = {}
+    for friend, rows in games.items():
+        for r in rows:
+            source, game, plat, s_dt, e_dt = r
+            if source != "xbox":
+                continue              # only console presence can be shared this way
+            key = (game, round(s_dt.timestamp() / SHARED_TOL), round(e_dt.timestamp() / SHARED_TOL))
+            sig.setdefault(key, []).append((friend, r))
+    for key, hits in sig.items():
+        friends = {f for f, _ in hits}
+        if len(friends) < 2:
+            continue
+        players = friends - share_hosts
+        if not players:
+            continue                  # every account is a host: cannot resolve
+        for friend, row in hits:
+            if friend in share_hosts:
+                games[friend] = [r for r in games[friend] if r is not row]
+                tag = (key[0], friend)
+                if tag not in _shared_logged:
+                    _shared_logged.add(tag)
+                    print(f"  [=] {friend} not credited for \"{key[0]}\": identical session to "
+                          f"{sorted(players)[0]} — signed in on their console to share Game Pass",
+                          flush=True)
+    return games
+
+
+def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None,
+                  share_hosts=None):
     """Resolved per-person totals + game breakdown for *today* (local).
 
     `extra_online`/`extra_games` carry in-progress sessions the collector holds in
@@ -428,6 +490,8 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
     for friend, source, game, s_dt, e_dt, plat in (extra_games or []):
         if today_dt(s_dt):
             games.setdefault(friend, []).append((source, game, plat, s_dt, e_dt))
+
+    games = _drop_shared_console_duplicates(games, share_hosts or set(), tz)
 
     out = {}
     for friend in set(online) | set(games):
@@ -460,13 +524,14 @@ def compute_daily(store, tz, steam_friends, extra_online=None, extra_games=None)
 # ---------------------------------------------------------------- client
 class Client:
     def __init__(self, ha_url, ha_token, store, tz, only, steam_key, steam_ids, kairos_url,
-                 ingest_token, game_apps=None, not_games=None):
+                 ingest_token, game_apps=None, not_games=None, share_hosts=None):
         self.ws_url = (ha_url.rstrip("/").replace("https://", "wss://").replace("http://", "ws://")
                        + "/api/websocket") if ha_url else None
         self.ha_token, self.store, self.tz, self.only = ha_token, store, tz, only
         self.steam_key, self.steam_ids = steam_key, steam_ids
         self.kairos_url = kairos_url.rstrip("/") if kairos_url else None
         self.ingest_token = ingest_token
+        self.share_hosts = share_hosts or set()
         self._id = 0
         self.on: dict[str, str] = {}; self.ig: dict[str, str] = {}
         self.np: dict[str, str] = {}; self.lo: dict[str, str] = {}
@@ -929,7 +994,8 @@ class Client:
         extra_games = ([(f, "xbox", g, s, e, plat) for (f, g, s, e, plat) in self.xbox.live_games(now)]
                        + [(f, "steam", g, s, e, None) for (f, g, s, e, plat) in self.steam.live_games(now)]
                        + [(f, "ally", g, s, e, plat) for (f, g, s, e, plat) in self.ally.live_games(now)])
-        days = compute_daily(self.store, self.tz, set(self.steam_ids), extra_online, extra_games)
+        days = compute_daily(self.store, self.tz, set(self.steam_ids), extra_online, extra_games,
+                             self.share_hosts)
         self._check_ally_ceiling(days, now)
         for friend in self.status:                       # include status even with no play today
             days.setdefault(friend, {"friend": friend, "date": today, "minutes": 0, "games": []})
@@ -980,9 +1046,9 @@ def _print_app_review(store):
         print(f"    {app:<34} {mins:>6.0f}m  (first seen {first[:10]})")
 
 
-def print_summary(store, tz, steam_friends):
+def print_summary(store, tz, steam_friends, share_hosts=None):
     today = datetime.now(tz).date().isoformat()
-    days = compute_daily(store, tz, steam_friends)
+    days = compute_daily(store, tz, steam_friends, share_hosts=share_hosts)
     if not days:
         print(f"No sessions recorded today ({today}).")
         _print_app_review(store)          # still worth seeing on a quiet morning
@@ -1306,6 +1372,41 @@ def selftest():
                             datetime(2026, 3, 1, tzinfo=timezone.utc))
     assert cl2._ally_warned == {}, "console time measured against the PC ceiling"
 
+    # --- shared-console Game Pass passenger ----------------------------------
+    H = lambda h, m: datetime(2026, 3, 1, h, m, tzinfo=timezone.utc)
+    def mk():
+        return {"P1": [("xbox", "Minecraft", "Xbox Series X|S", H(12, 37), H(13, 8))],
+                "P2": [("xbox", "Minecraft", "Xbox Series X|S", H(12, 37), H(13, 8))]}
+
+    # No hosts configured: nothing is dropped — guessing would invent data.
+    g = _drop_shared_console_duplicates(mk(), set(), timezone.utc)
+    assert len(g["P1"]) == 1 and len(g["P2"]) == 1, g
+
+    # P1 is the signed-in Game Pass host: the passenger copy goes, the player stays.
+    _shared_logged.clear()
+    g = _drop_shared_console_duplicates(mk(), {"P1"}, timezone.utc)
+    assert g["P1"] == [] and len(g["P2"]) == 1, g
+
+    # Same game on TWO consoles: boundaries differ, so both are genuine.
+    _shared_logged.clear()
+    two = {"P1": [("xbox", "Minecraft", "Xbox Series X|S", H(12, 37), H(13, 8))],
+           "P2": [("xbox", "Minecraft", "Xbox Series X|S", H(12, 51), H(13, 40))]}
+    g = _drop_shared_console_duplicates(two, {"P1"}, timezone.utc)
+    assert len(g["P1"]) == 1 and len(g["P2"]) == 1, g
+
+    # The host playing alone is never dropped.
+    _shared_logged.clear()
+    solo = {"P1": [("xbox", "Halo", "Xbox Series X|S", H(9, 0), H(9, 30))]}
+    g = _drop_shared_console_duplicates(solo, {"P1"}, timezone.utc)
+    assert len(g["P1"]) == 1, g
+
+    # Ally/Steam rows are never touched: only console presence can be shared.
+    _shared_logged.clear()
+    al = {"P1": [("ally", "GameX", "ally", H(12, 37), H(13, 8))],
+          "P2": [("ally", "GameX", "ally", H(12, 37), H(13, 8))]}
+    g = _drop_shared_console_duplicates(al, {"P1"}, timezone.utc)
+    assert len(g["P1"]) == 1 and len(g["P2"]) == 1, g
+
     print("selftest OK \u2713")
 
 
@@ -1316,7 +1417,8 @@ def main():
     store = Store(os.getenv("DB_PATH") or DEFAULT_DB)
     steam_ids = _parse_steam_ids(os.getenv("STEAM_IDS", ""))
     if "--summary" in sys.argv:
-        return print_summary(store, tz, set(steam_ids))
+        return print_summary(store, tz, set(steam_ids),
+                             set(x.strip() for x in os.getenv("GAMEPASS_HOSTS", "").split(",") if x.strip()))
     ha_url, ha_token = os.getenv("HA_URL"), os.getenv("HA_TOKEN")
     steam_key = os.getenv("STEAM_API_KEY")
     kairos_url, ingest_token = os.getenv("KAIROS_URL"), os.getenv("GAMETIME_INGEST_TOKEN")
@@ -1325,9 +1427,10 @@ def main():
     only = set(x.strip() for x in os.getenv("ONLY", "").split(",") if x.strip()) or None
     game_apps = _parse_game_apps(os.getenv("GAME_APPS", ""))
     not_games = _parse_not_games(os.getenv("NOT_GAME_APPS", ""))
+    share_hosts = set(x.strip() for x in os.getenv("GAMEPASS_HOSTS", "").split(",") if x.strip())
     try:
         asyncio.run(Client(ha_url, ha_token, store, tz, only, steam_key, steam_ids,
-                           kairos_url, ingest_token, game_apps, not_games).run())
+                           kairos_url, ingest_token, game_apps, not_games, share_hosts).run())
     except KeyboardInterrupt:
         print("\nstopped.")
 

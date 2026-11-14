@@ -164,6 +164,8 @@ forever. The local DB is only a buffer — Kairos keeps the durable history.
 | `XBOX_GAME_GAP_MIN` | no | `8` | Xbox same-game reconnect window, minutes |
 | `NOT_GAME_APPS` | no | built-in set | extends the built-in non-game denylist for the "ally" PC source (browsers, launchers, OS/vendor utilities). Everything not denied is credited as a game. |
 | `GAME_APPS` | no | — | display-name map for the ally source, `App=Display`. Shows a runtime process under the game's name and merges several processes into one session. Does not gate crediting. |
+| `GAMEPASS_HOSTS` | no | — | accounts that sign in on another child's console to share Game Pass. An identical Xbox session (same title, same start and end) is credited to the other child only. Unset = nothing dropped, duplicates only logged. |
+| `SHARED_TOL_SEC` | no | `60` | how close two sessions must be to count as one console session |
 | `ALLY_MIN_NEW_APP_MIN` | no | `5` | minutes a newly seen app must reach before it is reported for review |
 
 The collector also compares each child's credited **ally** time against their own

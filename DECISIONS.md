@@ -159,6 +159,38 @@ Minecraft Java is only app-open time via `ally`, below).
 - **No PII in this repo.** The allowlist, friend names and entity ids all come
   from env and runtime discovery; nothing identifying is committed.
 
+## Game Pass sharing: the signed-in passenger
+
+- **Observed (Nov 2026).** One child signed in on a sibling's console so the
+  sibling could play a Game Pass title. Xbox reported BOTH accounts as in that
+  game, and the collector logged two sessions with identical titles and
+  identical start/end times — crediting 46 minutes to a child who never played.
+- **No clean discriminator exists.** Microsoft's presence payload carries
+  `is_primary`, `title_id` and the device per entry, but HA's per-friend
+  `now_playing` sensor exposes only title metadata plus `platform`
+  (`Xbox Series X|S` / `Windows`). Nothing identifies WHICH console or who the
+  active user on it is, and two consoles of the same generation are
+  indistinguishable.
+- **Decision: drop the passenger's copy of an identical session.** Two accounts
+  on ONE console see the same presence transitions, so their sessions match to
+  the second; two children on two consoles start and stop independently and do
+  not. A duplicate is same source `xbox`, same title, and start AND end within
+  `SHARED_TOL` (60s).
+- **The passenger is named, not guessed.** `GAMEPASS_HOSTS` lists the accounts
+  that sign in to share. With it unset nothing is dropped and the duplicate is
+  only logged: picking a winner by heuristic would be inventing data, and a
+  wrong guess silently deletes a real session.
+- **Rejected: inferring the host from the Game Pass sensor.** It breaks the
+  moment the Game Pass holder plays something themselves, and the failure is
+  silent. Configuration is deterministic and the household knows the answer.
+- **Rejected: deleting the duplicate at write time.** Sessions are stored raw and
+  crediting is derived at read time, so the DB keeps the evidence and the rule
+  can change without a backfill.
+- **Accepted limit.** If the host genuinely plays the same title on the other
+  console with boundaries inside the tolerance, their session is dropped. It
+  requires two consoles, the same game and coincident start AND stop; the
+  duplicate case is far commoner.
+
 ## PC/Windows presence is unreliable (irreducible)
 
 - **Observation.** On Windows the `now_playing` title frequently drops to `None`
