@@ -117,6 +117,13 @@ Minecraft Java is only app-open time via `ally`, below).
 - **`GAME_APPS` is now display-naming only.** It no longer gates crediting; it
   maps a runtime process onto the game's own name and lets several processes
   resolve to ONE session.
+- **Game-store launchers are denied by default** (Epic, EA, GOG, Battle.net,
+  Ubisoft, Rockstar, Riot, itch, Steam, Xbox, CurseForge, Prism). Observed on the
+  first day of the denylist: one store launcher accrued 124 min while nobody was
+  playing through it, and its games report under their own names anyway. If a
+  title from one of those stores is ever played, it appears in the review list as
+  an unknown app and is credited automatically — the system self-corrects, so
+  denying a launcher costs nothing.
 - **Launchers are denied; runtimes are the signal.** Observed: a Minecraft
   launcher accrued 335 min in a day while its JVM — which only runs while the
   game runs — accrued 32. The launcher was left open. Where a game reports under

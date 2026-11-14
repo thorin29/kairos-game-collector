@@ -57,7 +57,7 @@ except Exception:
     websockets = None
 
 UNSET = {"", "none", "unknown", "unavailable"}
-COLLECTOR_VERSION = "5.1.0"
+COLLECTOR_VERSION = "5.1.1"
 COALESCE_GAP = timedelta(minutes=5)
 # How long a game session stays reconnectable after the game signal drops. If the
 # SAME game is confirmed again within this window, the two pieces are joined and
@@ -916,11 +916,23 @@ def _tzinfo(name):
     return timezone.utc
 
 
+def _print_app_review(store):
+    rows = store.app_review_rows()
+    if not rows:
+        return
+    print("\n--- ally apps credited as games but never classified ---")
+    print("    Add any that are NOT games to NOT_GAME_APPS, then restart.")
+    for app, friend, first, mins in rows:
+        print(f"    {app:<34} {mins:>6.0f}m  (first seen {first[:10]})")
+
+
 def print_summary(store, tz, steam_friends):
     today = datetime.now(tz).date().isoformat()
     days = compute_daily(store, tz, steam_friends)
     if not days:
-        print(f"No sessions recorded today ({today})."); return
+        print(f"No sessions recorded today ({today}).")
+        _print_app_review(store)          # still worth seeing on a quiet morning
+        return
     print(f"\n=== Game time for {today} ===")
     for friend in sorted(days):
         d = days[friend]; tot = d["minutes"]
@@ -932,12 +944,7 @@ def print_summary(store, tz, steam_friends):
         for g in sorted(d["games"], key=lambda x: -x["minutes"]):
             print(f"    {g['game']:<28} {g['minutes']/60:.1f}h  ({g['minutes']}m)")
 
-    rows = store.app_review_rows()
-    if rows:
-        print("\n--- ally apps credited as games but never classified ---")
-        print("    Add any that are NOT games to NOT_GAME_APPS, then restart.")
-        for app, friend, first, mins in rows:
-            print(f"    {app:<34} {mins:>6.0f}m  (first seen {first[:10]})")
+    _print_app_review(store)
 
 
 # Apps that are never play, shipped as a default so a fresh deployment is not
@@ -965,7 +972,9 @@ windows notepad, windows security, windows sound recorder, windows terminal,
 word, excel, google chrome, firefox, brave, bravesoftware update,
 braveupdate.exe, prism launcher, prism launcher installer, steam,
 steam client webhelper, xbox, the curseforge electron app, curseforge,
-ea app, discord, spotify, zoom, slack, vlc, notepad++, 7-zip
+ea, ea app, epic games launcher, epicgameslauncher, gog galaxy, battle.net,
+ubisoft connect, rockstar games launcher, riot client, itch,
+discord, spotify, zoom, slack, vlc, notepad++, 7-zip
 """
 
 
